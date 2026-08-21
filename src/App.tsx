@@ -25,6 +25,16 @@ type ParsedInvoice = {
   confidence: number;
 };
 
+type AccountingAssignment = {
+  supplier_account: string | null;
+  expense_account: string | null;
+  vat_account: string | null;
+  analytic_code: string | null;
+  confidence: number;
+  source: string;
+  use_count: number;
+};
+
 const emptyParsed: ParsedInvoice = {
   supplier: null,
   invoice_number: null,
@@ -36,6 +46,16 @@ const emptyParsed: ParsedInvoice = {
   iban: null,
   amounts_consistent: null,
   confidence: 0,
+};
+
+const emptyAccounting: AccountingAssignment = {
+  supplier_account: null,
+  expense_account: null,
+  vat_account: null,
+  analytic_code: null,
+  confidence: 0,
+  source: "manuel",
+  use_count: 0,
 };
 
 const isPdf = (path: string) => path.toLowerCase().endsWith(".pdf");
@@ -56,6 +76,8 @@ function App() {
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [parsed, setParsed] = useState<ParsedInvoice>(emptyParsed);
+  const [accounting, setAccounting] = useState<AccountingAssignment>(emptyAccounting);
+  const [rememberRule, setRememberRule] = useState(true);
   const [busyPath, setBusyPath] = useState<string | null>(null);
 
   const refreshInvoices = async () => {
@@ -152,23 +174,44 @@ function App() {
       invoke<string | null>("get_invoice_text", { path: file.path }),
       invoke<ParsedInvoice | null>("get_invoice_parsed", { path: file.path }),
     ]);
+
+    const parsedData = data ?? emptyParsed;
+    let accountingRule = emptyAccounting;
+    if (parsedData.supplier) {
+      accountingRule = await invoke<AccountingAssignment | null>("get_supplier_accounting", {
+        supplier: parsedData.supplier,
+      }) ?? emptyAccounting;
+    }
+
     setSelectedPath(file.path);
     setSelectedName(file.file_name);
     setSelectedText(text ?? "Aucun texte extrait.");
-    setParsed(data ?? emptyParsed);
+    setParsed(parsedData);
+    setAccounting(accountingRule);
+    setRememberRule(true);
   };
 
   const setField = (field: keyof ParsedInvoice, value: string) => {
     setParsed((current) => ({ ...current, [field]: value || null }));
   };
 
+  const setAccountingField = (field: keyof AccountingAssignment, value: string) => {
+    setAccounting((current) => ({ ...current, [field]: value || null, source: "manuel" }));
+  };
+
   const validate = async () => {
     if (!selectedPath) return;
-    await invoke("validate_invoice", { path: selectedPath, data: parsed });
+    await invoke("validate_invoice", {
+      path: selectedPath,
+      data: parsed,
+      accounting,
+      rememberRule,
+    });
     await refreshInvoices();
     setSelectedText(null);
     setSelectedName(null);
     setSelectedPath(null);
+    setAccounting(emptyAccounting);
   };
 
   const pendingCount = files.filter((file) => file.status === "nouvelle").length;
@@ -179,7 +222,7 @@ function App() {
     <main className="shell">
       <header className="topbar">
         <div><p className="eyebrow">Assistant Charlemagne</p><h1>Factures fournisseurs</h1></div>
-        <span className="status">V0.6 · OCR + validation</span>
+        <span className="status">V0.7 · Apprentissage fournisseur</span>
       </header>
 
       <section className="stats">
@@ -232,6 +275,23 @@ function App() {
                 <label>SIRET<input value={parsed.siret ?? ""} onChange={(e) => setField("siret", e.target.value)} /></label>
                 <label>IBAN<input value={parsed.iban ?? ""} onChange={(e) => setField("iban", e.target.value)} /></label>
               </div>
+
+              <div className="accounting-card">
+                <div className="accounting-heading">
+                  <div>
+                    <strong>Imputation comptable</strong>
+                    <span>{accounting.source === "regle_fournisseur" ? `Règle connue · confiance ${accounting.confidence}%` : "À renseigner"}</span>
+                  </div>
+                </div>
+                <div className="form-grid accounting-grid">
+                  <label>Compte fournisseur<input placeholder="401..." value={accounting.supplier_account ?? ""} onChange={(e) => setAccountingField("supplier_account", e.target.value)} /></label>
+                  <label>Compte de charge<input placeholder="6..." value={accounting.expense_account ?? ""} onChange={(e) => setAccountingField("expense_account", e.target.value)} /></label>
+                  <label>Compte TVA<input placeholder="445..." value={accounting.vat_account ?? ""} onChange={(e) => setAccountingField("vat_account", e.target.value)} /></label>
+                  <label>Analytique<input placeholder="Code analytique" value={accounting.analytic_code ?? ""} onChange={(e) => setAccountingField("analytic_code", e.target.value)} /></label>
+                </div>
+                <label className="remember-rule"><input type="checkbox" checked={rememberRule} onChange={(e) => setRememberRule(e.target.checked)} /> Mémoriser cette imputation pour ce fournisseur</label>
+              </div>
+
               <p className={`check ${parsed.amounts_consistent === true ? "ok" : parsed.amounts_consistent === false ? "bad" : "neutral"}`}>{parsed.amounts_consistent === true ? "✓ HT + TVA = TTC" : parsed.amounts_consistent === false ? "⚠ HT + TVA ≠ TTC" : "Montants incomplets : contrôle à faire"}</p>
               <button type="button" className="validate" onClick={validate}>VALIDER LA FACTURE</button>
             </div>
