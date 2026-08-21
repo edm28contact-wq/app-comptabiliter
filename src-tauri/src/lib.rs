@@ -1,6 +1,6 @@
 use regex::Regex;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -17,7 +17,7 @@ struct InvoiceRecord {
     text_length: i64,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 struct ParsedInvoice {
     supplier: Option<String>,
     invoice_number: Option<String>,
