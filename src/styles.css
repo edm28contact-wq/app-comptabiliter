@@ -10,13 +10,13 @@
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #f5f7fb; }
 button { font: inherit; }
 
-.shell { max-width: 1120px; margin: 0 auto; padding: 32px; }
+.shell { max-width: 1180px; margin: 0 auto; padding: 32px; }
 .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
 .eyebrow { margin: 0 0 4px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: #637083; }
 h1, h2, p { margin-top: 0; }
 h1 { margin-bottom: 0; font-size: 30px; }
 .status { padding: 8px 12px; border-radius: 999px; background: #e8edf5; color: #4b586b; font-size: 13px; font-weight: 700; }
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
 .stats article { background: white; border: 1px solid #e1e6ee; border-radius: 16px; padding: 18px; box-shadow: 0 8px 24px rgba(23,32,51,.04); }
 .stats strong { display: block; font-size: 26px; }
 .stats span { color: #6d7888; font-size: 14px; }
@@ -29,8 +29,8 @@ h1 { margin-bottom: 0; font-size: 30px; }
 .dropzone.is-dragging { border-color: #315efb; background: #f1f5ff; transform: translateY(-1px); }
 .drop-icon { width: 58px; height: 58px; display: grid; place-items: center; margin: 0 auto 16px; border-radius: 14px; background: #eef2ff; color: #315efb; font-weight: 800; }
 .dropzone p { color: #6d7888; }
-.queue { margin-top: 20px; background: white; border: 1px solid #e1e6ee; border-radius: 16px; overflow: hidden; }
-.section-heading { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid #eef1f5; }
+.queue, .text-preview { margin-top: 20px; background: white; border: 1px solid #e1e6ee; border-radius: 16px; overflow: hidden; }
+.section-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 20px; border-bottom: 1px solid #eef1f5; }
 .section-heading h2 { margin: 0; font-size: 18px; }
 .section-heading span { color: #788395; font-size: 14px; }
 .empty { padding: 28px 20px; color: #788395; }
@@ -39,5 +39,15 @@ li { display: flex; justify-content: space-between; gap: 16px; align-items: cent
 li:first-child { border-top: 0; }
 li strong, li small { display: block; }
 li small { max-width: 720px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8a94a3; }
-.pending { padding: 6px 9px; border-radius: 999px; background: #fff5d9; color: #8a6500; font-size: 12px; font-weight: 700; }
-@media (max-width: 760px) { .shell { padding: 20px; } .stats { grid-template-columns: 1fr; } .topbar, .folder-card { align-items: flex-start; gap: 16px; } .folder-card { flex-direction: column; } }
+.file-info { min-width: 0; flex: 1; }
+.file-actions { display: flex; gap: 8px; margin-top: 10px; }
+.secondary { border: 1px solid #d8dee8; background: white; color: #344054; border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px; font-weight: 700; }
+.badges { display: flex; align-items: flex-end; flex-direction: column; gap: 7px; }
+.pending, .extraction { padding: 6px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.pending { background: #fff5d9; color: #8a6500; }
+.extraction { background: #eef1f5; color: #556070; }
+.extraction.texte_extrait { background: #e9f8ef; color: #287244; }
+.extraction.ocr_requis { background: #fff0e6; color: #9a4c16; }
+.text-preview pre { max-height: 430px; margin: 0; padding: 20px; overflow: auto; white-space: pre-wrap; word-break: break-word; font: 13px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; color: #344054; }
+@media (max-width: 900px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 760px) { .shell { padding: 20px; } .stats { grid-template-columns: 1fr; } .topbar, .folder-card, li { align-items: flex-start; gap: 16px; } .folder-card { flex-direction: column; } li { flex-direction: column; } .badges { align-items: flex-start; } }
