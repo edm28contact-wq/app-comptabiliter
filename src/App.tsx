@@ -35,6 +35,13 @@ type AccountingAssignment = {
   use_count: number;
 };
 
+type StorageAssignment = {
+  archive_folder: string | null;
+  confidence: number;
+  source: string;
+  use_count: number;
+};
+
 const emptyParsed: ParsedInvoice = {
   supplier: null,
   invoice_number: null,
@@ -53,6 +60,13 @@ const emptyAccounting: AccountingAssignment = {
   expense_account: null,
   vat_account: null,
   analytic_code: null,
+  confidence: 0,
+  source: "manuel",
+  use_count: 0,
+};
+
+const emptyStorage: StorageAssignment = {
+  archive_folder: null,
   confidence: 0,
   source: "manuel",
   use_count: 0,
@@ -77,7 +91,9 @@ function App() {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [parsed, setParsed] = useState<ParsedInvoice>(emptyParsed);
   const [accounting, setAccounting] = useState<AccountingAssignment>(emptyAccounting);
+  const [storage, setStorage] = useState<StorageAssignment>(emptyStorage);
   const [rememberRule, setRememberRule] = useState(true);
+  const [rememberStorage, setRememberStorage] = useState(true);
   const [busyPath, setBusyPath] = useState<string | null>(null);
 
   const refreshInvoices = async () => {
@@ -147,6 +163,12 @@ function App() {
     }
   };
 
+  const chooseArchiveFolder = async () => {
+    const selected = await open({ multiple: false, directory: true });
+    if (!selected || Array.isArray(selected)) return;
+    setStorage({ archive_folder: selected, confidence: 0, source: "manuel", use_count: 0 });
+  };
+
   const reanalyze = async (file: InvoiceRecord) => {
     setBusyPath(file.path);
     try {
@@ -177,10 +199,12 @@ function App() {
 
     const parsedData = data ?? emptyParsed;
     let accountingRule = emptyAccounting;
+    let storageRule = emptyStorage;
     if (parsedData.supplier) {
-      accountingRule = await invoke<AccountingAssignment | null>("get_supplier_accounting", {
-        supplier: parsedData.supplier,
-      }) ?? emptyAccounting;
+      [accountingRule, storageRule] = await Promise.all([
+        invoke<AccountingAssignment | null>("get_supplier_accounting", { supplier: parsedData.supplier }).then((value) => value ?? emptyAccounting),
+        invoke<StorageAssignment | null>("get_supplier_storage", { supplier: parsedData.supplier }).then((value) => value ?? emptyStorage),
+      ]);
     }
 
     setSelectedPath(file.path);
@@ -188,7 +212,9 @@ function App() {
     setSelectedText(text ?? "Aucun texte extrait.");
     setParsed(parsedData);
     setAccounting(accountingRule);
+    setStorage(storageRule);
     setRememberRule(true);
+    setRememberStorage(true);
   };
 
   const setField = (field: keyof ParsedInvoice, value: string) => {
@@ -205,13 +231,16 @@ function App() {
       path: selectedPath,
       data: parsed,
       accounting,
+      storage,
       rememberRule,
+      rememberStorage,
     });
     await refreshInvoices();
     setSelectedText(null);
     setSelectedName(null);
     setSelectedPath(null);
     setAccounting(emptyAccounting);
+    setStorage(emptyStorage);
   };
 
   const pendingCount = files.filter((file) => file.status === "nouvelle").length;
@@ -222,7 +251,7 @@ function App() {
     <main className="shell">
       <header className="topbar">
         <div><p className="eyebrow">Assistant Charlemagne</p><h1>Factures fournisseurs</h1></div>
-        <span className="status">V0.7 · Apprentissage fournisseur</span>
+        <span className="status">V0.8 · Classement appris</span>
       </header>
 
       <section className="stats">
@@ -277,12 +306,7 @@ function App() {
               </div>
 
               <div className="accounting-card">
-                <div className="accounting-heading">
-                  <div>
-                    <strong>Imputation comptable</strong>
-                    <span>{accounting.source === "regle_fournisseur" ? `Règle connue · confiance ${accounting.confidence}%` : "À renseigner"}</span>
-                  </div>
-                </div>
+                <div className="accounting-heading"><div><strong>Imputation comptable</strong><span>{accounting.source === "regle_fournisseur" ? `Règle connue · confiance ${accounting.confidence}%` : "À renseigner"}</span></div></div>
                 <div className="form-grid accounting-grid">
                   <label>Compte fournisseur<input placeholder="401..." value={accounting.supplier_account ?? ""} onChange={(e) => setAccountingField("supplier_account", e.target.value)} /></label>
                   <label>Compte de charge<input placeholder="6..." value={accounting.expense_account ?? ""} onChange={(e) => setAccountingField("expense_account", e.target.value)} /></label>
@@ -290,6 +314,15 @@ function App() {
                   <label>Analytique<input placeholder="Code analytique" value={accounting.analytic_code ?? ""} onChange={(e) => setAccountingField("analytic_code", e.target.value)} /></label>
                 </div>
                 <label className="remember-rule"><input type="checkbox" checked={rememberRule} onChange={(e) => setRememberRule(e.target.checked)} /> Mémoriser cette imputation pour ce fournisseur</label>
+              </div>
+
+              <div className="accounting-card">
+                <div className="accounting-heading"><div><strong>Classement Windows</strong><span>{storage.source === "regle_fournisseur" ? `Dossier connu · confiance ${storage.confidence}%` : "Choisir un dossier d'archive existant"}</span></div></div>
+                <div className="archive-row">
+                  <div className="archive-path">{storage.archive_folder ?? "Aucun dossier d'archive sélectionné."}</div>
+                  <button type="button" className="secondary" onClick={chooseArchiveFolder}>Choisir</button>
+                </div>
+                <label className="remember-rule"><input type="checkbox" checked={rememberStorage} onChange={(e) => setRememberStorage(e.target.checked)} /> Mémoriser ce dossier pour ce fournisseur</label>
               </div>
 
               <p className={`check ${parsed.amounts_consistent === true ? "ok" : parsed.amounts_consistent === false ? "bad" : "neutral"}`}>{parsed.amounts_consistent === true ? "✓ HT + TVA = TTC" : parsed.amounts_consistent === false ? "⚠ HT + TVA ≠ TTC" : "Montants incomplets : contrôle à faire"}</p>
