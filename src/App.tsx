@@ -3,27 +3,57 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 
+type InvoiceRecord = {
+  path: string;
+  file_name: string;
+  source: string;
+  status: string;
+};
+
 const isPdf = (path: string) => path.toLowerCase().endsWith(".pdf");
 
 function App() {
-  const [files, setFiles] = useState<string[]>([]);
+  const [files, setFiles] = useState<InvoiceRecord[]>([]);
   const [dragging, setDragging] = useState(false);
   const [watchedFolder, setWatchedFolder] = useState<string | null>(null);
   const [folderError, setFolderError] = useState<string | null>(null);
 
-  const addFiles = (paths: string[]) => {
-    setFiles((current) => Array.from(new Set([...current, ...paths.filter(isPdf)])));
+  const refreshInvoices = async () => {
+    const records = await invoke<InvoiceRecord[]>("list_invoices");
+    setFiles(records);
+  };
+
+  const registerPaths = async (paths: string[], source: string) => {
+    const pdfs = paths.filter(isPdf);
+    await Promise.all(
+      pdfs.map((path) => invoke("register_invoice", { path, source }))
+    );
+    await refreshInvoices();
   };
 
   const scanFolder = async (folder: string) => {
     try {
-      const pdfs = await invoke<string[]>("scan_pdf_folder", { path: folder });
-      addFiles(pdfs);
+      await invoke<string[]>("scan_pdf_folder", { path: folder });
+      await refreshInvoices();
       setFolderError(null);
     } catch (error) {
       setFolderError(String(error));
     }
   };
+
+  useEffect(() => {
+    const restore = async () => {
+      try {
+        const savedFolder = await invoke<string | null>("get_watched_folder");
+        setWatchedFolder(savedFolder);
+        await refreshInvoices();
+      } catch (error) {
+        setFolderError(String(error));
+      }
+    };
+
+    void restore();
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -34,7 +64,7 @@ function App() {
         if (event.payload.type === "leave") setDragging(false);
         if (event.payload.type === "drop") {
           setDragging(false);
-          addFiles(event.payload.paths);
+          void registerPaths(event.payload.paths, "glisser-deposer");
         }
       })
       .then((fn) => {
@@ -63,7 +93,7 @@ function App() {
     });
 
     if (!selected) return;
-    addFiles(Array.isArray(selected) ? selected : [selected]);
+    await registerPaths(Array.isArray(selected) ? selected : [selected], "manuel");
   };
 
   const chooseFolder = async () => {
@@ -73,8 +103,18 @@ function App() {
     });
 
     if (!selected || Array.isArray(selected)) return;
-    setWatchedFolder(selected);
+
+    try {
+      await invoke("set_watched_folder", { path: selected });
+      setWatchedFolder(selected);
+      setFolderError(null);
+    } catch (error) {
+      setFolderError(String(error));
+    }
   };
+
+  const pendingCount = files.filter((file) => file.status === "nouvelle").length;
+  const validatedCount = files.filter((file) => file.status === "validee").length;
 
   return (
     <main className="shell">
@@ -83,13 +123,13 @@ function App() {
           <p className="eyebrow">Assistant Charlemagne</p>
           <h1>Factures fournisseurs</h1>
         </div>
-        <span className="status">V0.2 · Dossier Windows</span>
+        <span className="status">V0.3 · Persistance locale</span>
       </header>
 
       <section className="stats">
-        <article><strong>{files.length}</strong><span>Factures chargées</span></article>
-        <article><strong>0</strong><span>À vérifier</span></article>
-        <article><strong>0</strong><span>Validées</span></article>
+        <article><strong>{files.length}</strong><span>Factures enregistrées</span></article>
+        <article><strong>{pendingCount}</strong><span>À vérifier</span></article>
+        <article><strong>{validatedCount}</strong><span>Validées</span></article>
       </section>
 
       <section className="folder-card">
@@ -120,21 +160,18 @@ function App() {
         </div>
 
         {files.length === 0 ? (
-          <div className="empty">Aucune facture chargée.</div>
+          <div className="empty">Aucune facture enregistrée.</div>
         ) : (
           <ul>
-            {files.map((path) => {
-              const name = path.split(/[\\/]/).pop() ?? path;
-              return (
-                <li key={path}>
-                  <div>
-                    <strong>{name}</strong>
-                    <small>{path}</small>
-                  </div>
-                  <span className="pending">En attente</span>
-                </li>
-              );
-            })}
+            {files.map((file) => (
+              <li key={file.path}>
+                <div>
+                  <strong>{file.file_name}</strong>
+                  <small>{file.path} · source : {file.source}</small>
+                </div>
+                <span className="pending">{file.status}</span>
+              </li>
+            ))}
           </ul>
         )}
       </section>
