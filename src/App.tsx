@@ -25,11 +25,25 @@ type ParsedInvoice = {
   confidence: number;
 };
 
+const emptyParsed: ParsedInvoice = {
+  supplier: null,
+  invoice_number: null,
+  invoice_date: null,
+  amount_ht: null,
+  amount_vat: null,
+  amount_ttc: null,
+  siret: null,
+  iban: null,
+  amounts_consistent: null,
+  confidence: 0,
+};
+
 const isPdf = (path: string) => path.toLowerCase().endsWith(".pdf");
 
 const extractionLabel = (status: string) => {
   if (status === "texte_extrait") return "Texte lu";
   if (status === "ocr_requis") return "OCR requis";
+  if (status === "ocr_termine") return "OCR terminé";
   return "À analyser";
 };
 
@@ -40,22 +54,22 @@ function App() {
   const [folderError, setFolderError] = useState<string | null>(null);
   const [selectedText, setSelectedText] = useState<string | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
-  const [parsed, setParsed] = useState<ParsedInvoice | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [parsed, setParsed] = useState<ParsedInvoice>(emptyParsed);
+  const [busyPath, setBusyPath] = useState<string | null>(null);
 
   const refreshInvoices = async () => {
-    const records = await invoke<InvoiceRecord[]>("list_invoices");
-    setFiles(records);
+    setFiles(await invoke<InvoiceRecord[]>("list_invoices"));
   };
 
   const registerPaths = async (paths: string[], source: string) => {
-    const pdfs = paths.filter(isPdf);
-    await Promise.all(pdfs.map((path) => invoke("register_invoice", { path, source })));
+    await Promise.all(paths.filter(isPdf).map((path) => invoke("register_invoice", { path, source })));
     await refreshInvoices();
   };
 
   const scanFolder = async (folder: string) => {
     try {
-      await invoke<string[]>("scan_pdf_folder", { path: folder });
+      await invoke("scan_pdf_folder", { path: folder });
       await refreshInvoices();
       setFolderError(null);
     } catch (error) {
@@ -64,16 +78,14 @@ function App() {
   };
 
   useEffect(() => {
-    const restore = async () => {
+    void (async () => {
       try {
-        const savedFolder = await invoke<string | null>("get_watched_folder");
-        setWatchedFolder(savedFolder);
+        setWatchedFolder(await invoke<string | null>("get_watched_folder"));
         await refreshInvoices();
       } catch (error) {
         setFolderError(String(error));
       }
-    };
-    void restore();
+    })();
   }, []);
 
   useEffect(() => {
@@ -92,18 +104,13 @@ function App() {
   useEffect(() => {
     if (!watchedFolder) return;
     void scanFolder(watchedFolder);
-    const intervalId = window.setInterval(() => { void scanFolder(watchedFolder); }, 2000);
+    const intervalId = window.setInterval(() => void scanFolder(watchedFolder), 2000);
     return () => window.clearInterval(intervalId);
   }, [watchedFolder]);
 
   const chooseFiles = async () => {
-    const selected = await open({
-      multiple: true,
-      directory: false,
-      filters: [{ name: "Factures PDF", extensions: ["pdf"] }]
-    });
-    if (!selected) return;
-    await registerPaths(Array.isArray(selected) ? selected : [selected], "manuel");
+    const selected = await open({ multiple: true, directory: false, filters: [{ name: "Factures PDF", extensions: ["pdf"] }] });
+    if (selected) await registerPaths(Array.isArray(selected) ? selected : [selected], "manuel");
   };
 
   const chooseFolder = async () => {
@@ -119,18 +126,49 @@ function App() {
   };
 
   const reanalyze = async (file: InvoiceRecord) => {
-    await invoke("analyze_invoice", { path: file.path });
-    await refreshInvoices();
+    setBusyPath(file.path);
+    try {
+      await invoke("analyze_invoice", { path: file.path });
+      await refreshInvoices();
+    } finally {
+      setBusyPath(null);
+    }
+  };
+
+  const runOcr = async (file: InvoiceRecord) => {
+    setBusyPath(file.path);
+    try {
+      await invoke("run_invoice_ocr", { path: file.path });
+      await refreshInvoices();
+    } catch (error) {
+      setFolderError(`OCR : ${String(error)}`);
+    } finally {
+      setBusyPath(null);
+    }
   };
 
   const inspectInvoice = async (file: InvoiceRecord) => {
     const [text, data] = await Promise.all([
       invoke<string | null>("get_invoice_text", { path: file.path }),
-      invoke<ParsedInvoice | null>("get_invoice_parsed", { path: file.path })
+      invoke<ParsedInvoice | null>("get_invoice_parsed", { path: file.path }),
     ]);
+    setSelectedPath(file.path);
     setSelectedName(file.file_name);
     setSelectedText(text ?? "Aucun texte extrait.");
-    setParsed(data);
+    setParsed(data ?? emptyParsed);
+  };
+
+  const setField = (field: keyof ParsedInvoice, value: string) => {
+    setParsed((current) => ({ ...current, [field]: value || null }));
+  };
+
+  const validate = async () => {
+    if (!selectedPath) return;
+    await invoke("validate_invoice", { path: selectedPath, data: parsed });
+    await refreshInvoices();
+    setSelectedText(null);
+    setSelectedName(null);
+    setSelectedPath(null);
   };
 
   const pendingCount = files.filter((file) => file.status === "nouvelle").length;
@@ -140,11 +178,8 @@ function App() {
   return (
     <main className="shell">
       <header className="topbar">
-        <div>
-          <p className="eyebrow">Assistant Charlemagne</p>
-          <h1>Factures fournisseurs</h1>
-        </div>
-        <span className="status">V0.5 · Analyse structurée</span>
+        <div><p className="eyebrow">Assistant Charlemagne</p><h1>Factures fournisseurs</h1></div>
+        <span className="status">V0.6 · OCR + validation</span>
       </header>
 
       <section className="stats">
@@ -155,75 +190,50 @@ function App() {
       </section>
 
       <section className="folder-card">
-        <div>
-          <p className="eyebrow">Source automatique</p>
-          <h2>Dossier Windows surveillé</h2>
-          <p className="folder-path">{watchedFolder ?? "Aucun dossier connecté pour le moment."}</p>
-          {folderError && <p className="error">{folderError}</p>}
-        </div>
+        <div><p className="eyebrow">Source automatique</p><h2>Dossier Windows surveillé</h2><p className="folder-path">{watchedFolder ?? "Aucun dossier connecté."}</p>{folderError && <p className="error">{folderError}</p>}</div>
         <button type="button" onClick={chooseFolder}>{watchedFolder ? "Changer de dossier" : "Connecter un dossier"}</button>
       </section>
 
       <section className={`dropzone ${dragging ? "is-dragging" : ""}`}>
-        <div className="drop-icon">PDF</div>
-        <h2>Déposez vos factures ici</h2>
-        <p>Glissez des PDF depuis Windows ou sélectionnez-les manuellement.</p>
-        <button type="button" onClick={chooseFiles}>Ajouter des factures</button>
+        <div className="drop-icon">PDF</div><h2>Déposez vos factures ici</h2><p>Glissez des PDF depuis Windows ou sélectionnez-les manuellement.</p><button type="button" onClick={chooseFiles}>Ajouter des factures</button>
       </section>
 
       <section className="queue">
-        <div className="section-heading">
-          <h2>File de traitement</h2>
-          <span>{files.length} document{files.length > 1 ? "s" : ""}</span>
-        </div>
+        <div className="section-heading"><h2>File de traitement</h2><span>{files.length} document{files.length > 1 ? "s" : ""}</span></div>
         {files.length === 0 ? <div className="empty">Aucune facture enregistrée.</div> : (
-          <ul>
-            {files.map((file) => (
-              <li key={file.path}>
-                <div className="file-info">
-                  <strong>{file.file_name}</strong>
-                  <small>{file.path} · source : {file.source}</small>
-                  <div className="file-actions">
-                    {file.extraction_status === "texte_extrait" && (
-                      <button type="button" className="secondary" onClick={() => inspectInvoice(file)}>Contrôler</button>
-                    )}
-                    <button type="button" className="secondary" onClick={() => reanalyze(file)}>Réanalyser</button>
-                  </div>
+          <ul>{files.map((file) => (
+            <li key={file.path}>
+              <div className="file-info"><strong>{file.file_name}</strong><small>{file.path} · source : {file.source}</small>
+                <div className="file-actions">
+                  {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && <button type="button" className="secondary" onClick={() => inspectInvoice(file)}>Contrôler</button>}
+                  {file.extraction_status === "ocr_requis" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => runOcr(file)}>{busyPath === file.path ? "OCR…" : "Lancer OCR"}</button>}
+                  <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => reanalyze(file)}>Réanalyser</button>
                 </div>
-                <div className="badges">
-                  <span className={`extraction ${file.extraction_status}`}>
-                    {extractionLabel(file.extraction_status)}{file.text_length > 0 ? ` · ${file.text_length} car.` : ""}
-                  </span>
-                  <span className="pending">{file.status}</span>
-                </div>
-              </li>
-            ))}
-          </ul>
+              </div>
+              <div className="badges"><span className={`extraction ${file.extraction_status}`}>{extractionLabel(file.extraction_status)}{file.text_length > 0 ? ` · ${file.text_length} car.` : ""}</span><span className="pending">{file.status}</span></div>
+            </li>
+          ))}</ul>
         )}
       </section>
 
       {selectedText !== null && (
         <section className="review-panel">
-          <div className="section-heading">
-            <h2>Contrôle · {selectedName}</h2>
-            <button type="button" className="secondary" onClick={() => { setSelectedText(null); setParsed(null); }}>Fermer</button>
-          </div>
+          <div className="section-heading"><h2>Contrôle · {selectedName}</h2><button type="button" className="secondary" onClick={() => setSelectedText(null)}>Fermer</button></div>
           <div className="review-grid">
             <div className="parsed-card">
-              <div className="confidence">Confiance extraction : <strong>{parsed?.confidence ?? 0}%</strong></div>
-              <dl>
-                <div><dt>Fournisseur</dt><dd>{parsed?.supplier ?? "À vérifier"}</dd></div>
-                <div><dt>N° facture</dt><dd>{parsed?.invoice_number ?? "À vérifier"}</dd></div>
-                <div><dt>Date</dt><dd>{parsed?.invoice_date ?? "À vérifier"}</dd></div>
-                <div><dt>HT</dt><dd>{parsed?.amount_ht ? `${parsed.amount_ht} €` : "À vérifier"}</dd></div>
-                <div><dt>TVA</dt><dd>{parsed?.amount_vat ? `${parsed.amount_vat} €` : "À vérifier"}</dd></div>
-                <div><dt>TTC</dt><dd>{parsed?.amount_ttc ? `${parsed.amount_ttc} €` : "À vérifier"}</dd></div>
-                <div><dt>SIRET</dt><dd>{parsed?.siret ?? "Non détecté"}</dd></div>
-                <div><dt>IBAN</dt><dd>{parsed?.iban ?? "Non détecté"}</dd></div>
-              </dl>
-              <p className={`check ${parsed?.amounts_consistent === true ? "ok" : parsed?.amounts_consistent === false ? "bad" : "neutral"}`}>
-                {parsed?.amounts_consistent === true ? "✓ HT + TVA = TTC" : parsed?.amounts_consistent === false ? "⚠ HT + TVA ≠ TTC" : "Montants incomplets : contrôle à faire"}
-              </p>
+              <div className="confidence">Confiance extraction initiale : <strong>{parsed.confidence}%</strong></div>
+              <div className="form-grid">
+                <label>Fournisseur<input value={parsed.supplier ?? ""} onChange={(e) => setField("supplier", e.target.value)} /></label>
+                <label>N° facture<input value={parsed.invoice_number ?? ""} onChange={(e) => setField("invoice_number", e.target.value)} /></label>
+                <label>Date<input value={parsed.invoice_date ?? ""} onChange={(e) => setField("invoice_date", e.target.value)} /></label>
+                <label>HT<input value={parsed.amount_ht ?? ""} onChange={(e) => setField("amount_ht", e.target.value)} /></label>
+                <label>TVA<input value={parsed.amount_vat ?? ""} onChange={(e) => setField("amount_vat", e.target.value)} /></label>
+                <label>TTC<input value={parsed.amount_ttc ?? ""} onChange={(e) => setField("amount_ttc", e.target.value)} /></label>
+                <label>SIRET<input value={parsed.siret ?? ""} onChange={(e) => setField("siret", e.target.value)} /></label>
+                <label>IBAN<input value={parsed.iban ?? ""} onChange={(e) => setField("iban", e.target.value)} /></label>
+              </div>
+              <p className={`check ${parsed.amounts_consistent === true ? "ok" : parsed.amounts_consistent === false ? "bad" : "neutral"}`}>{parsed.amounts_consistent === true ? "✓ HT + TVA = TTC" : parsed.amounts_consistent === false ? "⚠ HT + TVA ≠ TTC" : "Montants incomplets : contrôle à faire"}</p>
+              <button type="button" className="validate" onClick={validate}>VALIDER LA FACTURE</button>
             </div>
             <div className="text-preview-inline"><pre>{selectedText}</pre></div>
           </div>
