@@ -4,6 +4,7 @@ include!("lib.rs");
 mod bank;
 mod bank_workspace;
 mod charlemagne_connector;
+mod charlemagne_mirror;
 mod charlemagne_sync;
 mod ingestion;
 
@@ -14,6 +15,10 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            charlemagne_mirror::initialize(app.handle()).map_err(std::io::Error::other)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_watched_folder,
             set_watched_folder,
