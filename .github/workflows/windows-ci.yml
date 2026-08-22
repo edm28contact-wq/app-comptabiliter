@@ -35,5 +35,13 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
-      - name: Build Tauri executable
-        run: npm run tauri build -- --debug --no-bundle
+      - name: Build Windows test installer
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Upload Windows test installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-comptabiliter-windows-test
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
