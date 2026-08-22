@@ -24,7 +24,6 @@ impl WinRtGuard {
     fn initialize() -> Result<Self, String> {
         unsafe {
             RoInitialize(RO_INIT_MULTITHREADED)
-                .ok()
                 .map_err(|error| format!("Initialisation OCR Windows impossible : {error}"))?;
         }
         Ok(Self)
