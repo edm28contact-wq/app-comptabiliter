@@ -3,6 +3,7 @@
 include!("lib.rs");
 mod bank;
 mod charlemagne_connector;
+mod charlemagne_sync;
 mod ingestion;
 mod workspace;
 
@@ -31,6 +32,8 @@ fn main() {
             scan_pdf_folder,
             charlemagne_connector::get_charlemagne_connector_status,
             charlemagne_connector::set_charlemagne_connector_mode,
+            charlemagne_sync::import_charlemagne_sync_file,
+            charlemagne_sync::list_charlemagne_sync_imports,
             workspace::get_bank_watched_folder,
             workspace::set_bank_watched_folder,
             workspace::scan_bank_folder,
