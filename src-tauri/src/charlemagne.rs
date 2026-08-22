@@ -52,12 +52,18 @@ fn required(value: Option<String>, label: &str, errors: &mut Vec<String>) -> Str
 }
 
 fn parse_amount(value: &str, label: &str, errors: &mut Vec<String>) -> Option<f64> {
-    let normalized = value
+    let cleaned = value
         .replace('€', "")
         .replace("EUR", "")
         .replace('\u{00a0}', "")
-        .replace(' ', "")
-        .replace(',', ".");
+        .replace('\u{202f}', "")
+        .replace(' ', "");
+
+    let normalized = if cleaned.contains(',') {
+        cleaned.replace('.', "").replace(',', ".")
+    } else {
+        cleaned
+    };
 
     match normalized.parse::<f64>() {
         Ok(amount) if amount.is_finite() && amount >= 0.0 => Some(amount),
@@ -91,17 +97,9 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedCharlemagneEntry, Vec<
     let expense_account = required(input.expense_account, "compte de charge", &mut errors);
     let amount_vat_raw = input.amount_vat.unwrap_or_else(|| "0.00".to_string());
 
-    let amount_ht = if amount_ht_raw.is_empty() {
-        None
-    } else {
-        parse_amount(&amount_ht_raw, "HT", &mut errors)
-    };
+    let amount_ht = if amount_ht_raw.is_empty() { None } else { parse_amount(&amount_ht_raw, "HT", &mut errors) };
     let amount_vat = parse_amount(&amount_vat_raw, "TVA", &mut errors);
-    let amount_ttc = if amount_ttc_raw.is_empty() {
-        None
-    } else {
-        parse_amount(&amount_ttc_raw, "TTC", &mut errors)
-    };
+    let amount_ttc = if amount_ttc_raw.is_empty() { None } else { parse_amount(&amount_ttc_raw, "TTC", &mut errors) };
 
     let vat_account = match amount_vat {
         Some(vat) if amount_is_zero(vat) => input.vat_account.unwrap_or_default(),
@@ -130,8 +128,8 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedCharlemagneEntry, Vec<
     let amount_ht_text = format_amount(amount_ht);
     let amount_vat_text = format_amount(amount_vat);
     let amount_ttc_text = format_amount(amount_ttc);
-
     let label = format!("{} - facture {}", supplier, invoice_number);
+
     let mut lines = vec![CharlemagneLine {
         account: expense_account,
         debit: amount_ht_text,
@@ -155,17 +153,14 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedCharlemagneEntry, Vec<
         debit: "0.00".to_string(),
         credit: amount_ttc_text.clone(),
         analytic_code: None,
-        label: label.clone(),
+        label,
     });
 
     let mut warnings = Vec::new();
     if input.analytic_code.is_none() {
         warnings.push("Aucun code analytique validé.".to_string());
     }
-    warnings.push(
-        "Écriture intermédiaire : aucun format Charlemagne spécifique n'est encore généré."
-            .to_string(),
-    );
+    warnings.push("Écriture intermédiaire : aucun format Charlemagne spécifique n'est encore généré.".to_string());
 
     Ok(PreparedCharlemagneEntry {
         date,
@@ -209,6 +204,16 @@ mod tests {
         assert_eq!(entry.lines[0].debit, "1000.00");
         assert_eq!(entry.lines[1].debit, "200.00");
         assert_eq!(entry.lines[2].credit, "1200.00");
+    }
+
+    #[test]
+    fn accepts_french_thousands_separator() {
+        let mut input = valid_input();
+        input.amount_ht = Some("1.000,00".to_string());
+        input.amount_vat = Some("200,00".to_string());
+        input.amount_ttc = Some("1.200,00".to_string());
+        let entry = prepare(input).expect("French thousands separators should be accepted");
+        assert_eq!(entry.total, "1200.00");
     }
 
     #[test]
