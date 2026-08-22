@@ -7,15 +7,35 @@ use std::{
     thread,
 };
 use windows::{
-    core::{init_mta, HSTRING},
+    core::HSTRING,
     Data::Pdf::{PdfDocument, PdfPageRenderOptions},
     Graphics::Imaging::BitmapDecoder,
     Media::Ocr::OcrEngine,
     Storage::StorageFile,
     Storage::Streams::InMemoryRandomAccessStream,
+    Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED},
 };
 
 const OCR_RENDER_LONG_EDGE: f32 = 1400.0;
+
+struct WinRtGuard;
+
+impl WinRtGuard {
+    fn initialize() -> Result<Self, String> {
+        unsafe {
+            RoInitialize(RO_INIT_MULTITHREADED)
+                .ok()
+                .map_err(|error| format!("Initialisation OCR Windows impossible : {error}"))?;
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for WinRtGuard {
+    fn drop(&mut self) {
+        unsafe { RoUninitialize() };
+    }
+}
 
 fn temporary_pdf_path(source: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
@@ -38,7 +58,7 @@ fn render_dimensions(width: f32, height: f32, max_dimension: u32) -> (u32, u32) 
 }
 
 fn ocr_local_pdf(path: &Path) -> Result<String, String> {
-    init_mta().map_err(|error| format!("Initialisation OCR Windows impossible : {error}"))?;
+    let _winrt = WinRtGuard::initialize()?;
 
     let path_string = path.to_string_lossy().into_owned();
     let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path_string))
