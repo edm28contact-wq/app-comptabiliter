@@ -4,15 +4,18 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process,
+    thread,
 };
 use windows::{
-    core::HSTRING,
-    Data::Pdf::PdfDocument,
-    Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat},
+    core::{init_mta, HSTRING},
+    Data::Pdf::{PdfDocument, PdfPageRenderOptions},
+    Graphics::Imaging::BitmapDecoder,
     Media::Ocr::OcrEngine,
     Storage::StorageFile,
     Storage::Streams::InMemoryRandomAccessStream,
 };
+
+const OCR_RENDER_LONG_EDGE: f32 = 1400.0;
 
 fn temporary_pdf_path(source: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
@@ -24,7 +27,19 @@ fn temporary_pdf_path(source: &str) -> PathBuf {
     ))
 }
 
+fn render_dimensions(width: f32, height: f32, max_dimension: u32) -> (u32, u32) {
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    let target_long_edge = OCR_RENDER_LONG_EDGE.min(max_dimension as f32).max(1.0);
+    let scale = target_long_edge / width.max(height);
+    let destination_width = (width * scale).round().max(1.0) as u32;
+    let destination_height = (height * scale).round().max(1.0) as u32;
+    (destination_width, destination_height)
+}
+
 fn ocr_local_pdf(path: &Path) -> Result<String, String> {
+    init_mta().map_err(|error| format!("Initialisation OCR Windows impossible : {error}"))?;
+
     let path_string = path.to_string_lossy().into_owned();
     let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path_string))
         .map_err(|error| error.to_string())?
@@ -36,13 +51,26 @@ fn ocr_local_pdf(path: &Path) -> Result<String, String> {
         .map_err(|error| error.to_string())?;
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()
         .map_err(|error| error.to_string())?;
+    let max_dimension = OcrEngine::MaxImageDimension().map_err(|error| error.to_string())?;
     let page_count = document.PageCount().map_err(|error| error.to_string())?;
     let mut output = String::new();
 
     for page_index in 0..page_count {
         let page = document.GetPage(page_index).map_err(|error| error.to_string())?;
+        let page_size = page.Size().map_err(|error| error.to_string())?;
+        let (destination_width, destination_height) =
+            render_dimensions(page_size.Width, page_size.Height, max_dimension);
+
+        let options = PdfPageRenderOptions::new().map_err(|error| error.to_string())?;
+        options
+            .SetDestinationWidth(destination_width)
+            .map_err(|error| error.to_string())?;
+        options
+            .SetDestinationHeight(destination_height)
+            .map_err(|error| error.to_string())?;
+
         let stream = InMemoryRandomAccessStream::new().map_err(|error| error.to_string())?;
-        page.RenderToStreamAsync(&stream)
+        page.RenderWithOptionsToStreamAsync(&stream, &options)
             .map_err(|error| error.to_string())?
             .join()
             .map_err(|error| error.to_string())?;
@@ -53,7 +81,7 @@ fn ocr_local_pdf(path: &Path) -> Result<String, String> {
             .join()
             .map_err(|error| error.to_string())?;
         let bitmap = decoder
-            .GetSoftwareBitmapConvertedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied)
+            .GetSoftwareBitmapAsync()
             .map_err(|error| error.to_string())?
             .join()
             .map_err(|error| error.to_string())?;
@@ -87,7 +115,31 @@ pub fn ocr_pdf(source: &str) -> Result<String, String> {
     fs::copy(source_path, &temporary_path)
         .map_err(|error| format!("Impossible de préparer le PDF pour l'OCR Windows : {error}"))?;
 
-    let result = ocr_local_pdf(&temporary_path);
+    let worker_path = temporary_path.clone();
+    let worker = thread::Builder::new()
+        .name("app-comptabiliter-ocr".to_string())
+        .spawn(move || ocr_local_pdf(&worker_path))
+        .map_err(|error| format!("Impossible de démarrer le moteur OCR : {error}"))?;
+
+    let result = worker
+        .join()
+        .map_err(|_| "Le moteur OCR Windows s'est arrêté de manière inattendue.".to_string())?;
     let _ = fs::remove_file(&temporary_path);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_dimensions;
+
+    #[test]
+    fn render_dimensions_limit_long_edge() {
+        assert_eq!(render_dimensions(595.0, 842.0, 10_000), (989, 1400));
+        assert_eq!(render_dimensions(842.0, 595.0, 10_000), (1400, 989));
+    }
+
+    #[test]
+    fn render_dimensions_respect_windows_limit() {
+        assert_eq!(render_dimensions(1000.0, 2000.0, 1000), (500, 1000));
+    }
 }
