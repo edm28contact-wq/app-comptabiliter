@@ -1,6 +1,6 @@
 [package]
 name = "app-comptabiliter"
-version = "0.1.0"
+version = "0.11.0"
 description = "Assistant de comptabilite fournisseurs pour Charlemagne"
 authors = ["edm28contact-wq"]
 edition = "2021"
