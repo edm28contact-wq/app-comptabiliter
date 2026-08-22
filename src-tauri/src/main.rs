@@ -32,15 +32,22 @@ fn main() {
             scan_pdf_folder,
             charlemagne_connector::get_charlemagne_connector_status,
             charlemagne_connector::set_charlemagne_connector_mode,
+            charlemagne_sync::get_charlemagne_sync_folder,
+            charlemagne_sync::set_charlemagne_sync_folder,
             charlemagne_sync::import_charlemagne_sync_file,
+            charlemagne_sync::commit_charlemagne_sync_file,
+            charlemagne_sync::scan_charlemagne_sync_folder,
             charlemagne_sync::list_charlemagne_sync_imports,
+            charlemagne_sync::get_charlemagne_sync_summary,
+            charlemagne_sync::list_charlemagne_accounts,
+            charlemagne_sync::list_charlemagne_suppliers,
+            charlemagne_sync::list_journal_entries,
             workspace::get_bank_watched_folder,
             workspace::set_bank_watched_folder,
             workspace::scan_bank_folder,
             workspace::list_bank_documents,
             workspace::run_bank_ocr,
-            workspace::get_bank_document_text,
-            workspace::list_journal_entries
+            workspace::get_bank_document_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
