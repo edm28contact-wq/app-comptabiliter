@@ -3,6 +3,7 @@
 include!("lib.rs");
 mod bank;
 mod charlemagne_connector;
+mod charlemagne_journal;
 mod charlemagne_sync;
 mod ingestion;
 mod workspace;
@@ -41,7 +42,7 @@ fn main() {
             charlemagne_sync::get_charlemagne_sync_summary,
             charlemagne_sync::list_charlemagne_accounts,
             charlemagne_sync::list_charlemagne_suppliers,
-            charlemagne_sync::list_journal_entries,
+            charlemagne_journal::list_journal_entries,
             workspace::get_bank_watched_folder,
             workspace::set_bank_watched_folder,
             workspace::scan_bank_folder,
