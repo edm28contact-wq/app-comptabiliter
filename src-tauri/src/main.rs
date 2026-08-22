@@ -2,6 +2,7 @@
 
 include!("lib.rs");
 mod bank;
+mod charlemagne_connector;
 mod ingestion;
 mod workspace;
 
@@ -28,6 +29,8 @@ fn main() {
             archive_invoice,
             list_invoices,
             scan_pdf_folder,
+            charlemagne_connector::get_charlemagne_connector_status,
+            charlemagne_connector::set_charlemagne_connector_mode,
             workspace::get_bank_watched_folder,
             workspace::set_bank_watched_folder,
             workspace::scan_bank_folder,
