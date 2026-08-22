@@ -1,3 +1,4 @@
+mod charlemagne;
 mod windows_ocr;
 
 use regex::Regex;
@@ -22,6 +23,8 @@ struct InvoiceRecord {
     text_length: i64,
     archive_path: Option<String>,
     archive_error: Option<String>,
+    charlemagne_status: String,
+    charlemagne_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -90,7 +93,10 @@ fn ensure_column(connection: &Connection, table: &str, column: &str, definition:
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
     let connection = Connection::open(database_path(app)?).map_err(|error| error.to_string())?;
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS invoices (
             path TEXT PRIMARY KEY,
             file_name TEXT NOT NULL,
@@ -111,7 +117,11 @@ fn open_database(app: &AppHandle) -> Result<Connection, String> {
             archive_path TEXT,
             content_hash TEXT,
             archive_error TEXT,
-            archived_at TEXT
+            archived_at TEXT,
+            prepared_charlemagne_json TEXT,
+            charlemagne_status TEXT NOT NULL DEFAULT 'a_preparer',
+            charlemagne_error TEXT,
+            charlemagne_prepared_at TEXT
          );
          CREATE TABLE IF NOT EXISTS supplier_accounting_rules (
             supplier_key TEXT PRIMARY KEY,
@@ -141,6 +151,10 @@ fn open_database(app: &AppHandle) -> Result<Connection, String> {
     ensure_column(&connection, "invoices", "content_hash", "TEXT")?;
     ensure_column(&connection, "invoices", "archive_error", "TEXT")?;
     ensure_column(&connection, "invoices", "archived_at", "TEXT")?;
+    ensure_column(&connection, "invoices", "prepared_charlemagne_json", "TEXT")?;
+    ensure_column(&connection, "invoices", "charlemagne_status", "TEXT NOT NULL DEFAULT 'a_preparer'")?;
+    ensure_column(&connection, "invoices", "charlemagne_error", "TEXT")?;
+    ensure_column(&connection, "invoices", "charlemagne_prepared_at", "TEXT")?;
     Ok(connection)
 }
 
@@ -150,7 +164,9 @@ fn first_capture(text: &str, patterns: &[&str]) -> Option<String> {
             if let Some(captures) = regex.captures(text) {
                 if let Some(value) = captures.get(1) {
                     let cleaned = value.as_str().trim().trim_matches(':').trim().to_string();
-                    if !cleaned.is_empty() { return Some(cleaned); }
+                    if !cleaned.is_empty() {
+                        return Some(cleaned);
+                    }
                 }
             }
         }
@@ -159,7 +175,14 @@ fn first_capture(text: &str, patterns: &[&str]) -> Option<String> {
 }
 
 fn parse_amount(value: &str) -> Option<f64> {
-    value.replace('€', "").replace("EUR", "").replace('\u{00a0}', "").replace(' ', "").replace(',', ".").parse().ok()
+    value
+        .replace('€', "")
+        .replace("EUR", "")
+        .replace('\u{00a0}', "")
+        .replace(' ', "")
+        .replace(',', ".")
+        .parse()
+        .ok()
 }
 
 fn normalize_amount(value: Option<String>) -> Option<String> {
@@ -182,24 +205,49 @@ fn parse_invoice_text(text: &str) -> ParsedInvoice {
         r"(?i)(?:facture|invoice)\s*(?:n[°oº]?|num(?:e|é)ro)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9._/-]{2,})",
         r"(?i)n[°oº]\s*facture\s*[:#-]?\s*([A-Z0-9][A-Z0-9._/-]{2,})",
     ]);
-    let invoice_date = first_capture(text, &[r"(?i)(?:date\s*(?:de\s*)?facture|date)\s*[:\-]?\s*(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})"]);
+    let invoice_date = first_capture(text, &[
+        r"(?i)(?:date\s*(?:de\s*)?facture|date)\s*[:\-]?\s*(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})",
+    ]);
     let amount_ht = normalize_amount(first_capture(text, &[
         r"(?i)(?:total\s*)?H\.?T\.?\s*[:\-]?\s*([0-9][0-9\s\u{00a0}.,]*)\s*(?:€|EUR)?",
         r"(?i)total\s+hors\s+taxe[s]?\s*[:\-]?\s*([0-9][0-9\s\u{00a0}.,]*)",
     ]));
-    let amount_vat = normalize_amount(first_capture(text, &[r"(?i)(?:total\s*)?TVA\s*[:\-]?\s*([0-9][0-9\s\u{00a0}.,]*)\s*(?:€|EUR)?"]));
-    let amount_ttc = normalize_amount(first_capture(text, &[r"(?i)(?:net\s+[àa]\s+payer|total\s*T\.?T\.?C\.?)\s*[:\-]?\s*([0-9][0-9\s\u{00a0}.,]*)\s*(?:€|EUR)?"]));
-    let siret = first_capture(text, &[r"(?i)SIRET\s*[:\-]?\s*([0-9][0-9\s]{12,18})"])
-        .map(|value| value.chars().filter(|character| character.is_ascii_digit()).collect());
-    let iban = first_capture(text, &[r"(?i)IBAN\s*[:\-]?\s*([A-Z]{2}[0-9]{2}(?:\s?[A-Z0-9]){10,30})"])
-        .map(|value| value.replace(' ', "").to_uppercase());
-    let supplier = text.lines().map(str::trim).filter(|line| line.len() >= 3 && line.len() <= 80)
+    let amount_vat = normalize_amount(first_capture(text, &[
+        r"(?i)(?:total\s*)?TVA\s*[:\-]?\s*([0-9][0-9\s\u{00a0}.,]*)\s*(?:€|EUR)?",
+    ]));
+    let amount_ttc = normalize_amount(first_capture(text, &[
+        r"(?i)(?:net\s+[àa]\s+payer|total\s*T\.?T\.?C\.?)\s*[:\-]?\s*([0-9][0-9\s\u{00a0}.,]*)\s*(?:€|EUR)?",
+    ]));
+    let siret = first_capture(text, &[
+        r"(?i)SIRET\s*[:\-]?\s*([0-9][0-9\s]{12,18})",
+    ])
+    .map(|value| value.chars().filter(|character| character.is_ascii_digit()).collect());
+    let iban = first_capture(text, &[
+        r"(?i)IBAN\s*[:\-]?\s*([A-Z]{2}[0-9]{2}(?:\s?[A-Z0-9]){10,30})",
+    ])
+    .map(|value| value.replace(' ', "").to_uppercase());
+    let supplier = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.len() >= 3 && line.len() <= 80)
         .find(|line| {
             let upper = line.to_uppercase();
             !upper.contains("FACTURE") && !upper.contains("INVOICE") && !upper.contains("TOTAL")
-        }).map(str::to_string);
+        })
+        .map(str::to_string);
 
-    let mut data = ParsedInvoice { supplier, invoice_number, invoice_date, amount_ht, amount_vat, amount_ttc, siret, iban, amounts_consistent: None, confidence: 0 };
+    let mut data = ParsedInvoice {
+        supplier,
+        invoice_number,
+        invoice_date,
+        amount_ht,
+        amount_vat,
+        amount_ttc,
+        siret,
+        iban,
+        amounts_consistent: None,
+        confidence: 0,
+    };
     data.amounts_consistent = compute_amount_consistency(&data);
     if data.supplier.is_some() { data.confidence += 15; }
     if data.invoice_number.is_some() { data.confidence += 20; }
@@ -213,7 +261,11 @@ fn parse_invoice_text(text: &str) -> ParsedInvoice {
 }
 
 fn normalize_supplier_key(value: &str) -> String {
-    value.chars().flat_map(|character| character.to_uppercase()).filter(|character| character.is_alphanumeric()).collect()
+    value
+        .chars()
+        .flat_map(|character| character.to_uppercase())
+        .filter(|character| character.is_alphanumeric())
+        .collect()
 }
 
 fn rule_confidence(use_count: i64) -> i32 {
@@ -222,15 +274,23 @@ fn rule_confidence(use_count: i64) -> i32 {
 
 fn get_supplier_rule(connection: &Connection, supplier: &str) -> Result<Option<AccountingAssignment>, String> {
     let supplier_key = normalize_supplier_key(supplier);
-    if supplier_key.is_empty() { return Ok(None); }
+    if supplier_key.is_empty() {
+        return Ok(None);
+    }
     match connection.query_row(
-        "SELECT supplier_account,expense_account,vat_account,analytic_code,use_count FROM supplier_accounting_rules WHERE supplier_key=?1",
+        "SELECT supplier_account,expense_account,vat_account,analytic_code,use_count
+         FROM supplier_accounting_rules WHERE supplier_key=?1",
         params![supplier_key],
         |row| {
             let use_count: i64 = row.get(4)?;
             Ok(AccountingAssignment {
-                supplier_account: row.get(0)?, expense_account: row.get(1)?, vat_account: row.get(2)?, analytic_code: row.get(3)?,
-                confidence: rule_confidence(use_count), source: "regle_fournisseur".to_string(), use_count,
+                supplier_account: row.get(0)?,
+                expense_account: row.get(1)?,
+                vat_account: row.get(2)?,
+                analytic_code: row.get(3)?,
+                confidence: rule_confidence(use_count),
+                source: "regle_fournisseur".to_string(),
+                use_count,
             })
         },
     ) {
@@ -243,27 +303,49 @@ fn get_supplier_rule(connection: &Connection, supplier: &str) -> Result<Option<A
 fn save_supplier_rule(connection: &Connection, supplier: &str, accounting: &AccountingAssignment) -> Result<(), String> {
     let supplier_name = supplier.trim();
     let supplier_key = normalize_supplier_key(supplier_name);
-    if supplier_key.is_empty() { return Err("Le fournisseur est requis pour mémoriser une règle comptable.".to_string()); }
+    if supplier_key.is_empty() {
+        return Err("Le fournisseur est requis pour mémoriser une règle comptable.".to_string());
+    }
     connection.execute(
-        "INSERT INTO supplier_accounting_rules (supplier_key,supplier_name,supplier_account,expense_account,vat_account,analytic_code,use_count)
+        "INSERT INTO supplier_accounting_rules
+         (supplier_key,supplier_name,supplier_account,expense_account,vat_account,analytic_code,use_count)
          VALUES (?1,?2,?3,?4,?5,?6,1)
-         ON CONFLICT(supplier_key) DO UPDATE SET supplier_name=excluded.supplier_name,supplier_account=excluded.supplier_account,
-         expense_account=excluded.expense_account,vat_account=excluded.vat_account,analytic_code=excluded.analytic_code,
-         use_count=supplier_accounting_rules.use_count+1,updated_at=CURRENT_TIMESTAMP",
-        params![supplier_key,supplier_name,accounting.supplier_account,accounting.expense_account,accounting.vat_account,accounting.analytic_code],
+         ON CONFLICT(supplier_key) DO UPDATE SET
+            supplier_name=excluded.supplier_name,
+            supplier_account=excluded.supplier_account,
+            expense_account=excluded.expense_account,
+            vat_account=excluded.vat_account,
+            analytic_code=excluded.analytic_code,
+            use_count=supplier_accounting_rules.use_count+1,
+            updated_at=CURRENT_TIMESTAMP",
+        params![
+            supplier_key,
+            supplier_name,
+            accounting.supplier_account,
+            accounting.expense_account,
+            accounting.vat_account,
+            accounting.analytic_code
+        ],
     ).map_err(|error| error.to_string())?;
     Ok(())
 }
 
 fn get_storage_rule(connection: &Connection, supplier: &str) -> Result<Option<StorageAssignment>, String> {
     let supplier_key = normalize_supplier_key(supplier);
-    if supplier_key.is_empty() { return Ok(None); }
+    if supplier_key.is_empty() {
+        return Ok(None);
+    }
     match connection.query_row(
         "SELECT archive_folder,use_count FROM supplier_storage_rules WHERE supplier_key=?1",
         params![supplier_key],
         |row| {
             let use_count: i64 = row.get(1)?;
-            Ok(StorageAssignment { archive_folder: row.get(0)?, confidence: rule_confidence(use_count), source: "regle_fournisseur".to_string(), use_count })
+            Ok(StorageAssignment {
+                archive_folder: row.get(0)?,
+                confidence: rule_confidence(use_count),
+                source: "regle_fournisseur".to_string(),
+                use_count,
+            })
         },
     ) {
         Ok(rule) => Ok(Some(rule)),
@@ -273,16 +355,28 @@ fn get_storage_rule(connection: &Connection, supplier: &str) -> Result<Option<St
 }
 
 fn save_storage_rule(connection: &Connection, supplier: &str, storage: &StorageAssignment) -> Result<(), String> {
-    let folder = storage.archive_folder.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    let folder = storage
+        .archive_folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| "Le dossier d'archive est requis pour mémoriser le classement.".to_string())?;
-    if !Path::new(folder).is_dir() { return Err("Le dossier d'archive n'est pas accessible.".to_string()); }
+    if !Path::new(folder).is_dir() {
+        return Err("Le dossier d'archive n'est pas accessible.".to_string());
+    }
     let supplier_name = supplier.trim();
     let supplier_key = normalize_supplier_key(supplier_name);
-    if supplier_key.is_empty() { return Err("Le fournisseur est requis pour mémoriser le classement.".to_string()); }
+    if supplier_key.is_empty() {
+        return Err("Le fournisseur est requis pour mémoriser le classement.".to_string());
+    }
     connection.execute(
-        "INSERT INTO supplier_storage_rules (supplier_key,supplier_name,archive_folder,use_count) VALUES (?1,?2,?3,1)
-         ON CONFLICT(supplier_key) DO UPDATE SET supplier_name=excluded.supplier_name,archive_folder=excluded.archive_folder,
-         use_count=supplier_storage_rules.use_count+1,updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO supplier_storage_rules (supplier_key,supplier_name,archive_folder,use_count)
+         VALUES (?1,?2,?3,1)
+         ON CONFLICT(supplier_key) DO UPDATE SET
+            supplier_name=excluded.supplier_name,
+            archive_folder=excluded.archive_folder,
+            use_count=supplier_storage_rules.use_count+1,
+            updated_at=CURRENT_TIMESTAMP",
         params![supplier_key,supplier_name,folder],
     ).map_err(|error| error.to_string())?;
     Ok(())
@@ -298,12 +392,20 @@ fn sanitize_filename_component(value: &str, fallback: &str) -> String {
         })
         .collect();
     let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() { fallback.to_string() } else { trimmed.chars().take(80).collect() }
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
 }
 
 fn normalize_date_for_filename(value: Option<&str>) -> String {
-    let Some(value) = value else { return "date-inconnue".to_string(); };
-    let parts: Vec<&str> = value.split(|character| character == '/' || character == '.' || character == '-').collect();
+    let Some(value) = value else {
+        return "date-inconnue".to_string();
+    };
+    let parts: Vec<&str> = value
+        .split(|character| character == '/' || character == '.' || character == '-')
+        .collect();
     if parts.len() == 3 {
         let day = parts[0].trim();
         let month = parts[1].trim();
@@ -322,7 +424,9 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -330,29 +434,61 @@ fn file_sha256(path: &Path) -> Result<String, String> {
 
 fn unique_archive_path(folder: &Path, file_name: &str) -> PathBuf {
     let desired = folder.join(file_name);
-    if !desired.exists() { return desired; }
-    let stem = Path::new(file_name).file_stem().and_then(|value| value.to_str()).unwrap_or("facture");
-    let extension = Path::new(file_name).extension().and_then(|value| value.to_str()).unwrap_or("pdf");
+    if !desired.exists() {
+        return desired;
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("facture");
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("pdf");
     for index in 2..10_000 {
         let candidate = folder.join(format!("{stem}_{index}.{extension}"));
-        if !candidate.exists() { return candidate; }
+        if !candidate.exists() {
+            return candidate;
+        }
     }
     folder.join(format!("{stem}_collision.{extension}"))
 }
 
 fn build_archive_name(data: &ParsedInvoice) -> String {
     let date = normalize_date_for_filename(data.invoice_date.as_deref());
-    let supplier = sanitize_filename_component(data.supplier.as_deref().unwrap_or("fournisseur"), "fournisseur");
-    let number = sanitize_filename_component(data.invoice_number.as_deref().unwrap_or("sans-numero"), "sans-numero");
-    let amount = sanitize_filename_component(data.amount_ttc.as_deref().unwrap_or("montant-inconnu"), "montant-inconnu");
+    let supplier = sanitize_filename_component(
+        data.supplier.as_deref().unwrap_or("fournisseur"),
+        "fournisseur",
+    );
+    let number = sanitize_filename_component(
+        data.invoice_number.as_deref().unwrap_or("sans-numero"),
+        "sans-numero",
+    );
+    let amount = sanitize_filename_component(
+        data.amount_ttc.as_deref().unwrap_or("montant-inconnu"),
+        "montant-inconnu",
+    );
     format!("{date}_{supplier}_{number}_{amount}EUR.pdf")
 }
 
 fn copy_verified(source: &Path, destination: &Path) -> Result<(String, bool), String> {
     let source_hash = file_sha256(source)?;
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_millis();
-    let temp_name = format!(".{}.{}.part", destination.file_name().and_then(|value| value.to_str()).unwrap_or("facture.pdf"), timestamp);
-    let temp_path = destination.parent().ok_or_else(|| "Dossier de destination invalide.".to_string())?.join(temp_name);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    let temp_name = format!(
+        ".{}.{}.part",
+        destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("facture.pdf"),
+        timestamp
+    );
+    let temp_path = destination
+        .parent()
+        .ok_or_else(|| "Dossier de destination invalide.".to_string())?
+        .join(temp_name);
 
     let copy_result = (|| -> Result<(), String> {
         let mut input = File::open(source).map_err(|error| error.to_string())?;
@@ -392,106 +528,246 @@ fn extract_native_text(connection: &Connection, path: &str) -> Result<(), String
     match pdf_extract::extract_text(path) {
         Ok(text) => {
             let length = text.chars().filter(|character| !character.is_whitespace()).count();
-            if length >= 40 { persist_text_and_parse(connection,path,&text,"texte_extrait")?; }
-            else { connection.execute("UPDATE invoices SET extracted_text=?2,extraction_status='ocr_requis',text_length=?3,updated_at=CURRENT_TIMESTAMP WHERE path=?1",params![path,text,length as i64]).map_err(|error| error.to_string())?; }
+            if length >= 40 {
+                persist_text_and_parse(connection, path, &text, "texte_extrait")?;
+            } else {
+                connection.execute(
+                    "UPDATE invoices SET extracted_text=?2,extraction_status='ocr_requis',text_length=?3,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+                    params![path,text,length as i64],
+                ).map_err(|error| error.to_string())?;
+            }
         }
-        Err(error) => { connection.execute("UPDATE invoices SET extraction_status='ocr_requis',extraction_error=?2,text_length=0,updated_at=CURRENT_TIMESTAMP WHERE path=?1",params![path,error.to_string()]).map_err(|database_error| database_error.to_string())?; }
+        Err(error) => {
+            connection.execute(
+                "UPDATE invoices SET extraction_status='ocr_requis',extraction_error=?2,text_length=0,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+                params![path,error.to_string()],
+            ).map_err(|database_error| database_error.to_string())?;
+        }
     }
     Ok(())
 }
 
 fn store_invoice(connection: &Connection, path: &str, source: &str) -> Result<(), String> {
-    let file_name = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_string();
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string();
     let inserted = connection.execute(
         "INSERT OR IGNORE INTO invoices (path,file_name,source,original_path) VALUES (?1,?2,?3,?1)",
         params![path,file_name,source],
     ).map_err(|error| error.to_string())? > 0;
-    if inserted { extract_native_text(connection,path)?; }
+    if inserted {
+        extract_native_text(connection, path)?;
+    }
     Ok(())
+}
+
+fn prepare_charlemagne_for_connection(
+    connection: &Connection,
+    path: &str,
+) -> Result<charlemagne::PreparedCharlemagneEntry, String> {
+    let row: (Option<String>, Option<String>, Option<String>) = connection.query_row(
+        "SELECT validated_json,validated_accounting_json,archive_path FROM invoices WHERE path=?1",
+        params![path],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).map_err(|error| error.to_string())?;
+
+    let invoice_json = row.0.ok_or_else(|| "La facture n'a pas encore été validée.".to_string())?;
+    let accounting_json = row.1.ok_or_else(|| "L'imputation comptable validée est absente.".to_string())?;
+    let invoice: ParsedInvoice = serde_json::from_str(&invoice_json).map_err(|error| error.to_string())?;
+    let accounting: AccountingAssignment = serde_json::from_str(&accounting_json).map_err(|error| error.to_string())?;
+    let document_path = row.2.or_else(|| Some(path.to_string()));
+
+    let result = charlemagne::prepare(charlemagne::PreparationInput {
+        supplier: invoice.supplier.clone(),
+        invoice_number: invoice.invoice_number.clone(),
+        invoice_date: invoice.invoice_date.clone(),
+        amount_ht: invoice.amount_ht.clone(),
+        amount_vat: invoice.amount_vat.clone(),
+        amount_ttc: invoice.amount_ttc.clone(),
+        supplier_account: accounting.supplier_account.clone(),
+        expense_account: accounting.expense_account.clone(),
+        vat_account: accounting.vat_account.clone(),
+        analytic_code: accounting.analytic_code.clone(),
+        document_path,
+    });
+
+    match result {
+        Ok(entry) => {
+            let json = serde_json::to_string(&entry).map_err(|error| error.to_string())?;
+            connection.execute(
+                "UPDATE invoices SET prepared_charlemagne_json=?2,charlemagne_status='pret',charlemagne_error=NULL,charlemagne_prepared_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+                params![path,json],
+            ).map_err(|error| error.to_string())?;
+            Ok(entry)
+        }
+        Err(errors) => {
+            let message = errors.join(" · ");
+            connection.execute(
+                "UPDATE invoices SET prepared_charlemagne_json=NULL,charlemagne_status='incomplet',charlemagne_error=?2,charlemagne_prepared_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+                params![path,message],
+            ).map_err(|error| error.to_string())?;
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
 fn get_watched_folder(app: AppHandle) -> Result<Option<String>, String> {
     let connection = open_database(&app)?;
-    match connection.query_row("SELECT value FROM settings WHERE key='watched_folder'",[],|row| row.get(0)) {
-        Ok(value) => Ok(Some(value)), Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None), Err(error) => Err(error.to_string()),
+    match connection.query_row(
+        "SELECT value FROM settings WHERE key='watched_folder'",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
 }
 
 #[tauri::command]
 fn set_watched_folder(app: AppHandle, path: String) -> Result<(), String> {
-    if !Path::new(&path).is_dir() { return Err("Le chemin sélectionné n'est pas un dossier accessible.".to_string()); }
+    if !Path::new(&path).is_dir() {
+        return Err("Le chemin sélectionné n'est pas un dossier accessible.".to_string());
+    }
     let connection = open_database(&app)?;
-    connection.execute("INSERT INTO settings(key,value) VALUES('watched_folder',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![path]).map_err(|error| error.to_string())?;
+    connection.execute(
+        "INSERT INTO settings(key,value) VALUES('watched_folder',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![path],
+    ).map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn register_invoice(app: AppHandle, path: String, source: String) -> Result<(), String> {
-    if !path.to_lowercase().ends_with(".pdf") { return Err("Seuls les fichiers PDF sont acceptés pour le moment.".to_string()); }
+    if !path.to_lowercase().ends_with(".pdf") {
+        return Err("Seuls les fichiers PDF sont acceptés pour le moment.".to_string());
+    }
     let connection = open_database(&app)?;
-    store_invoice(&connection,&path,&source)
+    store_invoice(&connection, &path, &source)
 }
 
 #[tauri::command]
 fn analyze_invoice(app: AppHandle, path: String) -> Result<(), String> {
     let connection = open_database(&app)?;
-    extract_native_text(&connection,&path)
+    extract_native_text(&connection, &path)
 }
 
 #[tauri::command]
 fn run_invoice_ocr(app: AppHandle, path: String) -> Result<(), String> {
     let text = windows_ocr::ocr_pdf(&path)?;
-    if text.chars().filter(|character| !character.is_whitespace()).count() < 20 { return Err("L'OCR Windows n'a pas trouvé assez de texte exploitable.".to_string()); }
+    if text.chars().filter(|character| !character.is_whitespace()).count() < 20 {
+        return Err("L'OCR Windows n'a pas trouvé assez de texte exploitable.".to_string());
+    }
     let connection = open_database(&app)?;
-    persist_text_and_parse(&connection,&path,&text,"ocr_termine")
+    persist_text_and_parse(&connection, &path, &text, "ocr_termine")
 }
 
 #[tauri::command]
 fn get_invoice_text(app: AppHandle, path: String) -> Result<Option<String>, String> {
     let connection = open_database(&app)?;
-    match connection.query_row("SELECT extracted_text FROM invoices WHERE path=?1",params![path],|row| row.get(0)) {
-        Ok(value) => Ok(value), Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None), Err(error) => Err(error.to_string()),
+    match connection.query_row(
+        "SELECT extracted_text FROM invoices WHERE path=?1",
+        params![path],
+        |row| row.get(0),
+    ) {
+        Ok(value) => Ok(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
 }
 
 #[tauri::command]
 fn get_invoice_parsed(app: AppHandle, path: String) -> Result<Option<ParsedInvoice>, String> {
     let connection = open_database(&app)?;
-    let value: Option<String> = match connection.query_row("SELECT parsed_json FROM invoices WHERE path=?1",params![path],|row| row.get(0)) {
-        Ok(value) => value, Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None), Err(error) => return Err(error.to_string()),
+    let value: Option<String> = match connection.query_row(
+        "SELECT parsed_json FROM invoices WHERE path=?1",
+        params![path],
+        |row| row.get(0),
+    ) {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
     };
-    value.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string())).transpose()
+    value
+        .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .transpose()
 }
 
 #[tauri::command]
 fn get_supplier_accounting(app: AppHandle, supplier: String) -> Result<Option<AccountingAssignment>, String> {
     let connection = open_database(&app)?;
-    get_supplier_rule(&connection,&supplier)
+    get_supplier_rule(&connection, &supplier)
 }
 
 #[tauri::command]
 fn get_supplier_storage(app: AppHandle, supplier: String) -> Result<Option<StorageAssignment>, String> {
     let connection = open_database(&app)?;
-    get_storage_rule(&connection,&supplier)
+    get_storage_rule(&connection, &supplier)
 }
 
 #[tauri::command]
-fn validate_invoice(app: AppHandle, path: String, mut data: ParsedInvoice, accounting: AccountingAssignment, storage: StorageAssignment, remember_rule: bool, remember_storage: bool) -> Result<(), String> {
+fn validate_invoice(
+    app: AppHandle,
+    path: String,
+    mut data: ParsedInvoice,
+    accounting: AccountingAssignment,
+    storage: StorageAssignment,
+    remember_rule: bool,
+    remember_storage: bool,
+) -> Result<(), String> {
     data.amounts_consistent = compute_amount_consistency(&data);
     let connection = open_database(&app)?;
     let invoice_json = serde_json::to_string(&data).map_err(|error| error.to_string())?;
     let accounting_json = serde_json::to_string(&accounting).map_err(|error| error.to_string())?;
     let storage_json = serde_json::to_string(&storage).map_err(|error| error.to_string())?;
     connection.execute(
-        "UPDATE invoices SET validated_json=?2,validated_accounting_json=?3,validated_storage_json=?4,validated_at=CURRENT_TIMESTAMP,status='validee',archive_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+        "UPDATE invoices SET validated_json=?2,validated_accounting_json=?3,validated_storage_json=?4,validated_at=CURRENT_TIMESTAMP,status='validee',archive_error=NULL,prepared_charlemagne_json=NULL,charlemagne_status='a_preparer',charlemagne_error=NULL,charlemagne_prepared_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
         params![path,invoice_json,accounting_json,storage_json],
     ).map_err(|error| error.to_string())?;
+
     if let Some(supplier) = data.supplier.as_deref() {
-        if remember_rule { save_supplier_rule(&connection,supplier,&accounting)?; }
-        if remember_storage && storage.archive_folder.is_some() { save_storage_rule(&connection,supplier,&storage)?; }
+        if remember_rule {
+            save_supplier_rule(&connection, supplier, &accounting)?;
+        }
+        if remember_storage && storage.archive_folder.is_some() {
+            save_storage_rule(&connection, supplier, &storage)?;
+        }
     }
+
+    let _ = prepare_charlemagne_for_connection(&connection, &path);
     Ok(())
+}
+
+#[tauri::command]
+fn prepare_charlemagne_invoice(
+    app: AppHandle,
+    path: String,
+) -> Result<charlemagne::PreparedCharlemagneEntry, String> {
+    let connection = open_database(&app)?;
+    prepare_charlemagne_for_connection(&connection, &path)
+}
+
+#[tauri::command]
+fn get_charlemagne_prepared(
+    app: AppHandle,
+    path: String,
+) -> Result<Option<charlemagne::PreparedCharlemagneEntry>, String> {
+    let connection = open_database(&app)?;
+    let value: Option<String> = match connection.query_row(
+        "SELECT prepared_charlemagne_json FROM invoices WHERE path=?1",
+        params![path],
+        |row| row.get(0),
+    ) {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    value
+        .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .transpose()
 }
 
 #[tauri::command]
@@ -510,25 +786,38 @@ fn archive_invoice(app: AppHandle, path: String) -> Result<ArchiveResult, String
     let storage_json = row.2.ok_or_else(|| "Destination d'archive absente.".to_string())?;
     let data: ParsedInvoice = serde_json::from_str(&invoice_json).map_err(|error| error.to_string())?;
     let storage: StorageAssignment = serde_json::from_str(&storage_json).map_err(|error| error.to_string())?;
-    let folder_value = storage.archive_folder.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    let folder_value = storage
+        .archive_folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| "Aucun dossier d'archive n'a été sélectionné.".to_string())?;
     let folder = Path::new(folder_value);
-    if !folder.is_dir() { return Err("Le dossier d'archive n'est pas accessible.".to_string()); }
+    if !folder.is_dir() {
+        return Err("Le dossier d'archive n'est pas accessible.".to_string());
+    }
 
     let source = Path::new(&path);
-    if !source.is_file() { return Err("Le fichier source n'est plus accessible.".to_string()); }
+    if !source.is_file() {
+        return Err("Le fichier source n'est plus accessible.".to_string());
+    }
     let archive_name = build_archive_name(&data);
-    let destination = unique_archive_path(folder,&archive_name);
+    let destination = unique_archive_path(folder, &archive_name);
 
-    match copy_verified(source,&destination) {
-        Ok((content_hash,source_deleted)) => {
+    match copy_verified(source, &destination) {
+        Ok((content_hash, source_deleted)) => {
             let destination_string = destination.to_string_lossy().into_owned();
             let new_status = if source_deleted { "classee" } else { "archive_source_presente" };
             connection.execute(
                 "UPDATE invoices SET original_path=COALESCE(original_path,path),archive_path=?2,content_hash=?3,archive_error=NULL,archived_at=CURRENT_TIMESTAMP,status=?4,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
                 params![path,destination_string,content_hash,new_status],
             ).map_err(|error| error.to_string())?;
-            Ok(ArchiveResult { archive_path: destination.to_string_lossy().into_owned(), content_hash, source_deleted })
+            let _ = prepare_charlemagne_for_connection(&connection, &path);
+            Ok(ArchiveResult {
+                archive_path: destination.to_string_lossy().into_owned(),
+                content_hash,
+                source_deleted,
+            })
         }
         Err(error) => {
             connection.execute(
@@ -544,34 +833,71 @@ fn archive_invoice(app: AppHandle, path: String) -> Result<ArchiveResult, String
 fn list_invoices(app: AppHandle) -> Result<Vec<InvoiceRecord>, String> {
     let connection = open_database(&app)?;
     let mut statement = connection.prepare(
-        "SELECT path,file_name,source,status,extraction_status,text_length,archive_path,archive_error FROM invoices ORDER BY first_seen_at DESC,file_name ASC"
+        "SELECT path,file_name,source,status,extraction_status,text_length,archive_path,archive_error,charlemagne_status,charlemagne_error
+         FROM invoices ORDER BY first_seen_at DESC,file_name ASC"
     ).map_err(|error| error.to_string())?;
-    let rows = statement.query_map([],|row| Ok(InvoiceRecord {
-        path: row.get(0)?, file_name: row.get(1)?, source: row.get(2)?, status: row.get(3)?, extraction_status: row.get(4)?,
-        text_length: row.get(5)?, archive_path: row.get(6)?, archive_error: row.get(7)?,
-    })).map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>,_>>().map_err(|error| error.to_string())
+    let rows = statement.query_map([], |row| {
+        Ok(InvoiceRecord {
+            path: row.get(0)?,
+            file_name: row.get(1)?,
+            source: row.get(2)?,
+            status: row.get(3)?,
+            extraction_status: row.get(4)?,
+            text_length: row.get(5)?,
+            archive_path: row.get(6)?,
+            archive_error: row.get(7)?,
+            charlemagne_status: row.get(8)?,
+            charlemagne_error: row.get(9)?,
+        })
+    }).map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn scan_pdf_folder(app: AppHandle, path: String) -> Result<Vec<String>, String> {
-    if !Path::new(&path).is_dir() { return Err("Le chemin sélectionné n'est pas un dossier accessible.".to_string()); }
+    if !Path::new(&path).is_dir() {
+        return Err("Le chemin sélectionné n'est pas un dossier accessible.".to_string());
+    }
     let connection = open_database(&app)?;
     let mut pdfs = Vec::new();
     for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
         let file_path = entry.map_err(|error| error.to_string())?.path();
-        if file_path.is_file() && file_path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) {
-            let value = file_path.to_string_lossy().into_owned(); store_invoice(&connection,&value,"dossier")?; pdfs.push(value);
+        if file_path.is_file()
+            && file_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        {
+            let value = file_path.to_string_lossy().into_owned();
+            store_invoice(&connection, &value, "dossier")?;
+            pdfs.push(value);
         }
     }
-    pdfs.sort(); Ok(pdfs)
+    pdfs.sort();
+    Ok(pdfs)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default().plugin(tauri_plugin_dialog::init()).invoke_handler(tauri::generate_handler![
-        get_watched_folder,set_watched_folder,register_invoice,analyze_invoice,run_invoice_ocr,
-        get_invoice_text,get_invoice_parsed,get_supplier_accounting,get_supplier_storage,validate_invoice,
-        archive_invoice,list_invoices,scan_pdf_folder
-    ]).run(tauri::generate_context!()).expect("error while running tauri application");
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            get_watched_folder,
+            set_watched_folder,
+            register_invoice,
+            analyze_invoice,
+            run_invoice_ocr,
+            get_invoice_text,
+            get_invoice_parsed,
+            get_supplier_accounting,
+            get_supplier_storage,
+            validate_invoice,
+            prepare_charlemagne_invoice,
+            get_charlemagne_prepared,
+            archive_invoice,
+            list_invoices,
+            scan_pdf_folder
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
