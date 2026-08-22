@@ -12,6 +12,8 @@ type InvoiceRecord = {
   text_length: number;
   archive_path: string | null;
   archive_error: string | null;
+  charlemagne_status: string;
+  charlemagne_error: string | null;
 };
 
 type ParsedInvoice = {
@@ -95,6 +97,12 @@ const invoiceStatusLabel = (status: string) => {
   if (status === "archive_erreur") return "Erreur archive";
   if (status === "archive_source_presente") return "Archivée · source présente";
   return "À vérifier";
+};
+
+const charlemagneLabel = (status: string) => {
+  if (status === "pret") return "Prête Charlemagne";
+  if (status === "incomplet") return "Charlemagne incomplet";
+  return "Charlemagne à préparer";
 };
 
 function App() {
@@ -223,6 +231,19 @@ function App() {
     }
   };
 
+  const prepareCharlemagne = async (file: InvoiceRecord) => {
+    setBusyPath(file.path);
+    try {
+      await invoke("prepare_charlemagne_invoice", { path: file.path });
+      setFolderError(null);
+    } catch (error) {
+      setFolderError(`Charlemagne : ${String(error)}`);
+    } finally {
+      await refreshInvoices();
+      setBusyPath(null);
+    }
+  };
+
   const inspectInvoice = async (file: InvoiceRecord) => {
     const [text, data] = await Promise.all([
       invoke<string | null>("get_invoice_text", { path: file.path }),
@@ -303,21 +324,21 @@ function App() {
 
   const pendingCount = files.filter((file) => file.status === "nouvelle").length;
   const validatedCount = files.filter((file) => ["validee", "classee", "archive_source_presente"].includes(file.status)).length;
-  const archivedCount = files.filter((file) => file.status === "classee").length;
+  const readyCharlemagneCount = files.filter((file) => file.charlemagne_status === "pret").length;
   const ocrCount = files.filter((file) => file.extraction_status === "ocr_requis").length;
 
   return (
     <main className="shell">
       <header className="topbar">
         <div><p className="eyebrow">Assistant Charlemagne</p><h1>Factures fournisseurs</h1></div>
-        <span className="status">V0.9 · Archivage vérifié</span>
+        <span className="status">V0.10 · Préparation Charlemagne</span>
       </header>
 
       <section className="stats">
         <article><strong>{files.length}</strong><span>Factures enregistrées</span></article>
         <article><strong>{pendingCount}</strong><span>À vérifier</span></article>
         <article><strong>{ocrCount}</strong><span>OCR requis</span></article>
-        <article><strong>{archivedCount}/{validatedCount}</strong><span>Classées / validées</span></article>
+        <article><strong>{readyCharlemagneCount}/{validatedCount}</strong><span>Prêtes Charlemagne</span></article>
       </section>
 
       <section className="folder-card">
@@ -338,15 +359,18 @@ function App() {
                 <strong>{file.file_name}</strong>
                 <small>{file.path} · source : {file.source}</small>
                 {file.archive_path && <small className="archive-success">Archive : {file.archive_path}</small>}
-                {file.archive_error && <small className="archive-failure">Erreur : {file.archive_error}</small>}
+                {file.archive_error && <small className="archive-failure">Erreur archive : {file.archive_error}</small>}
+                {file.charlemagne_error && <small className="charlemagne-failure">Charlemagne : {file.charlemagne_error}</small>}
                 <div className="file-actions">
                   {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && file.status !== "classee" && <button type="button" className="secondary" onClick={() => inspectInvoice(file)}>Contrôler</button>}
                   {file.extraction_status === "ocr_requis" && file.status === "nouvelle" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => runOcr(file)}>{busyPath === file.path ? "OCR…" : "Lancer OCR"}</button>}
                   {file.status === "nouvelle" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => reanalyze(file)}>Réanalyser</button>}
                   {file.status === "archive_erreur" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => retryArchive(file)}>{busyPath === file.path ? "Archivage…" : "Réessayer archivage"}</button>}
+                  {file.status !== "nouvelle" && file.charlemagne_status !== "pret" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => prepareCharlemagne(file)}>{busyPath === file.path ? "Préparation…" : "Préparer Charlemagne"}</button>}
                 </div>
               </div>
               <div className="badges">
+                <span className={`charlemagne ${file.charlemagne_status}`}>{charlemagneLabel(file.charlemagne_status)}</span>
                 <span className={`extraction ${file.extraction_status}`}>{extractionLabel(file.extraction_status)}{file.text_length > 0 ? ` · ${file.text_length} car.` : ""}</span>
                 <span className={`pending status-${file.status}`}>{invoiceStatusLabel(file.status)}</span>
               </div>
