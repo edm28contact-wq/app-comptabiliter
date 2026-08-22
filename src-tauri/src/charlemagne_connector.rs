@@ -26,15 +26,17 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
     let connection = Connection::open(database_path(app)?).map_err(|error| error.to_string())?;
-    connection.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=FULL;
-         PRAGMA busy_timeout=5000;
-         CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-         );"
-    ).map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA busy_timeout=5000;
+             CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );",
+        )
+        .map_err(|error| error.to_string())?;
     Ok(connection)
 }
 
@@ -57,7 +59,7 @@ fn status_for_mode(mode: &str) -> CharlemagneConnectorStatus {
             live_ready: true,
             preparation_ready: true,
             blocked_reason: Some(
-                "Lecture locale des exports activée. Aucun accès direct à la base Charlemagne et aucun envoi automatique."
+                "Mode principal : les exports Charlemagne alimentent le plan de comptes, le journal et les règles fournisseurs. Aucun accès direct à la base Charlemagne."
                     .to_string(),
             ),
             switch_available: true,
@@ -81,7 +83,7 @@ fn status_for_mode(mode: &str) -> CharlemagneConnectorStatus {
             live_ready: false,
             preparation_ready: true,
             blocked_reason: Some(
-                "Le format d'import doit être confirmé sur votre installation avant génération de fichiers de production."
+                "Mode de secours : le format d'import doit être confirmé sur votre installation avant génération de fichiers de production."
                     .to_string(),
             ),
             switch_available: true,
@@ -90,26 +92,39 @@ fn status_for_mode(mode: &str) -> CharlemagneConnectorStatus {
 }
 
 #[tauri::command]
-pub fn get_charlemagne_connector_status(app: AppHandle) -> Result<CharlemagneConnectorStatus, String> {
+pub fn get_charlemagne_connector_status(
+    app: AppHandle,
+) -> Result<CharlemagneConnectorStatus, String> {
     let connection = open_database(&app)?;
-    let stored: Option<String> = connection.query_row(
-        "SELECT value FROM settings WHERE key='charlemagne_connector_mode'",
-        [],
-        |row| row.get(0),
-    ).optional().map_err(|error| error.to_string())?;
-    let mode = stored.as_deref().and_then(|value| normalize_mode(value).ok()).unwrap_or(MODE_IMPORT_V1);
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='charlemagne_connector_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let mode = stored
+        .as_deref()
+        .and_then(|value| normalize_mode(value).ok())
+        .unwrap_or(MODE_SYNC_V2);
     Ok(status_for_mode(mode))
 }
 
 #[tauri::command]
-pub fn set_charlemagne_connector_mode(app: AppHandle, mode: String) -> Result<CharlemagneConnectorStatus, String> {
+pub fn set_charlemagne_connector_mode(
+    app: AppHandle,
+    mode: String,
+) -> Result<CharlemagneConnectorStatus, String> {
     let mode = normalize_mode(&mode)?;
     let connection = open_database(&app)?;
-    connection.execute(
-        "INSERT INTO settings(key,value) VALUES('charlemagne_connector_mode',?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![mode],
-    ).map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO settings(key,value) VALUES('charlemagne_connector_mode',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![mode],
+        )
+        .map_err(|error| error.to_string())?;
     Ok(status_for_mode(mode))
 }
 
@@ -118,18 +133,17 @@ mod tests {
     use super::{normalize_mode, status_for_mode, MODE_API_V3, MODE_IMPORT_V1, MODE_SYNC_V2};
 
     #[test]
-    fn defaults_are_safe_and_non_live() {
-        let status = status_for_mode(MODE_IMPORT_V1);
+    fn v2_is_the_primary_ready_mode() {
+        let status = status_for_mode(MODE_SYNC_V2);
         assert!(status.preparation_ready);
-        assert!(!status.live_ready);
+        assert!(status.live_ready);
+        assert_eq!(status.mode, MODE_SYNC_V2);
     }
 
     #[test]
-    fn sync_mode_is_available_without_direct_database_access() {
-        let status = status_for_mode(MODE_SYNC_V2);
-        assert_eq!(status.mode, MODE_SYNC_V2);
-        assert!(status.live_ready);
-        assert!(status.blocked_reason.is_some());
+    fn v1_remains_a_safe_fallback() {
+        let status = status_for_mode(MODE_IMPORT_V1);
+        assert!(!status.live_ready);
     }
 
     #[test]
