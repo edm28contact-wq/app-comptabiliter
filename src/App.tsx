@@ -78,6 +78,12 @@ type ArchiveResult = {
   source_deleted: boolean;
 };
 
+type JournalTotals = {
+  debit: number;
+  credit: number;
+  count: number;
+};
+
 const emptyParsed: ParsedInvoice = {
   supplier: null,
   invoice_number: null,
@@ -120,7 +126,8 @@ const classLabels: Record<string, string> = {
 
 const isPdf = (path: string) => path.toLowerCase().endsWith(".pdf");
 const amount = (value: string) => Number.parseFloat(value || "0") || 0;
-const euro = (value: number) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
+const euro = (value: number) =>
+  new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
 
 const extractionLabel = (status: string) => {
   if (status === "attente_stabilite") return "Copie en cours";
@@ -140,6 +147,24 @@ const invoiceStatusLabel = (status: string) => {
   if (status === "doublon") return "Doublon";
   return "À vérifier";
 };
+
+const yearFromDate = (value: string) => {
+  const parts = value.trim().split(/[./-]/);
+  const rawYear = parts.at(-1) ?? "";
+  if (/^\d{4}$/.test(rawYear)) return rawYear;
+  if (/^\d{2}$/.test(rawYear)) return `20${rawYear}`;
+  return null;
+};
+
+const totalsForEntries = (entries: JournalEntryRow[]): JournalTotals =>
+  entries.reduce(
+    (totals, entry) => ({
+      debit: totals.debit + amount(entry.debit),
+      credit: totals.credit + amount(entry.credit),
+      count: totals.count + 1,
+    }),
+    { debit: 0, credit: 0, count: 0 },
+  );
 
 function App() {
   const [page, setPage] = useState<Page>("accueil");
@@ -161,7 +186,9 @@ function App() {
   const [rememberStorage, setRememberStorage] = useState(true);
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [journalClass, setJournalClass] = useState<string | null>(null);
+  const [journalPrefix, setJournalPrefix] = useState<string | null>(null);
   const [journalAccount, setJournalAccount] = useState<string | null>(null);
+  const [journalYear, setJournalYear] = useState(String(new Date().getFullYear()));
   const automaticOcrAttempted = useRef(new Set<string>());
   const invoiceScanBusy = useRef(false);
   const bankScanBusy = useRef(false);
@@ -171,8 +198,7 @@ function App() {
   const refreshJournal = async () => setJournalEntries(await invoke<JournalEntryRow[]>("list_journal_entries"));
 
   const refreshAll = async () => {
-    const tasks = [refreshInvoices(), refreshBank(), refreshJournal()];
-    const results = await Promise.allSettled(tasks);
+    const results = await Promise.allSettled([refreshInvoices(), refreshBank(), refreshJournal()]);
     const failure = results.find((result) => result.status === "rejected");
     if (failure?.status === "rejected") setMessage(String(failure.reason));
   };
@@ -228,14 +254,18 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    getCurrentWindow().onDragDropEvent((event) => {
-      if (event.payload.type === "over") setDragging(true);
-      if (event.payload.type === "leave") setDragging(false);
-      if (event.payload.type === "drop") {
-        setDragging(false);
-        void registerPaths(event.payload.paths, "glisser-deposer");
-      }
-    }).then((fn) => { unlisten = fn; });
+    getCurrentWindow()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "over") setDragging(true);
+        if (event.payload.type === "leave") setDragging(false);
+        if (event.payload.type === "drop") {
+          setDragging(false);
+          void registerPaths(event.payload.paths, "glisser-deposer");
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
     return () => unlisten?.();
   }, []);
 
@@ -255,14 +285,23 @@ function App() {
 
   useEffect(() => {
     if (busyPath) return;
-    const candidate = files.find((file) => file.extraction_status === "ocr_requis" && file.status === "nouvelle" && !automaticOcrAttempted.current.has(file.path));
+    const candidate = files.find(
+      (file) =>
+        file.extraction_status === "ocr_requis" &&
+        file.status === "nouvelle" &&
+        !automaticOcrAttempted.current.has(file.path),
+    );
     if (!candidate) return;
     automaticOcrAttempted.current.add(candidate.path);
     void runOcr(candidate, true);
   }, [files, busyPath]);
 
   const chooseFiles = async () => {
-    const selected = await open({ multiple: true, directory: false, filters: [{ name: "Factures PDF", extensions: ["pdf"] }] });
+    const selected = await open({
+      multiple: true,
+      directory: false,
+      filters: [{ name: "Factures PDF", extensions: ["pdf"] }],
+    });
     if (selected) await registerPaths(Array.isArray(selected) ? selected : [selected], "manuel");
   };
 
@@ -359,8 +398,12 @@ function App() {
     let storageRule = emptyStorage;
     if (parsedData.supplier) {
       [accountingRule, storageRule] = await Promise.all([
-        invoke<AccountingAssignment | null>("get_supplier_accounting", { supplier: parsedData.supplier }).then((value) => value ?? emptyAccounting),
-        invoke<StorageAssignment | null>("get_supplier_storage", { supplier: parsedData.supplier }).then((value) => value ?? emptyStorage),
+        invoke<AccountingAssignment | null>("get_supplier_accounting", {
+          supplier: parsedData.supplier,
+        }).then((value) => value ?? emptyAccounting),
+        invoke<StorageAssignment | null>("get_supplier_storage", {
+          supplier: parsedData.supplier,
+        }).then((value) => value ?? emptyStorage),
       ]);
     }
     setSelectedPath(file.path);
@@ -376,7 +419,10 @@ function App() {
 
   const inspectBank = async (file: BankDocumentRecord) => {
     const text = await invoke<string | null>("get_bank_document_text", { path: file.path });
-    setBankPreview({ name: file.file_name, text: text ?? "Aucun texte exploitable pour le moment." });
+    setBankPreview({
+      name: file.file_name,
+      text: text ?? "Aucun texte exploitable pour le moment.",
+    });
   };
 
   const closeReview = () => {
@@ -387,20 +433,33 @@ function App() {
     setStorage(emptyStorage);
   };
 
-  const setField = (field: keyof ParsedInvoice, value: string) => setParsed((current) => ({ ...current, [field]: value || null }));
-  const setAccountingField = (field: keyof AccountingAssignment, value: string) => setAccounting((current) => ({ ...current, [field]: value || null, source: "manuel" }));
+  const setField = (field: keyof ParsedInvoice, value: string) =>
+    setParsed((current) => ({ ...current, [field]: value || null }));
+
+  const setAccountingField = (field: keyof AccountingAssignment, value: string) =>
+    setAccounting((current) => ({ ...current, [field]: value || null, source: "manuel" }));
 
   const validate = async () => {
     if (!selectedPath) return;
     const invoicePath = selectedPath;
     setBusyPath(invoicePath);
     try {
-      await invoke("validate_invoice", { path: invoicePath, data: parsed, accounting, storage, rememberRule, rememberStorage });
+      await invoke("validate_invoice", {
+        path: invoicePath,
+        data: parsed,
+        accounting,
+        storage,
+        rememberRule,
+        rememberStorage,
+      });
       if (storage.archive_folder) {
         try {
           const result = await invoke<ArchiveResult>("archive_invoice", { path: invoicePath });
-          if (!result.source_deleted) setMessage(`Archive vérifiée, mais la source reste présente : ${result.archive_path}`);
-          else setMessage(null);
+          if (!result.source_deleted) {
+            setMessage(`Archive vérifiée, mais la source reste présente : ${result.archive_path}`);
+          } else {
+            setMessage(null);
+          }
         } catch (error) {
           setMessage(`Facture validée, archivage à reprendre : ${String(error)}`);
         }
@@ -416,13 +475,35 @@ function App() {
   };
 
   const pendingCount = files.filter((file) => file.status === "nouvelle").length;
-  const errorCount = files.filter((file) => file.status === "archive_erreur" || file.charlemagne_status === "incomplet").length;
+  const errorCount = files.filter(
+    (file) => file.status === "archive_erreur" || file.charlemagne_status === "incomplet",
+  ).length;
   const readyCharlemagneCount = files.filter((file) => file.charlemagne_status === "pret").length;
-  const bankPending = bankFiles.filter((file) => file.status === "a_verifier" || file.status === "nouveau").length;
+  const bankPending = bankFiles.filter(
+    (file) => file.status === "a_verifier" || file.status === "nouveau",
+  ).length;
+
+  const availableYears = useMemo(() => {
+    const years = new Set<string>();
+    years.add(String(new Date().getFullYear()));
+    for (const entry of journalEntries) {
+      const year = yearFromDate(entry.date);
+      if (year) years.add(year);
+    }
+    return [...years].sort((left, right) => right.localeCompare(left));
+  }, [journalEntries]);
+
+  const yearEntries = useMemo(
+    () =>
+      journalYear === "all"
+        ? journalEntries
+        : journalEntries.filter((entry) => yearFromDate(entry.date) === journalYear),
+    [journalEntries, journalYear],
+  );
 
   const journalByClass = useMemo(() => {
-    const map = new Map<string, { debit: number; credit: number; count: number }>();
-    for (const entry of journalEntries) {
+    const map = new Map<string, JournalTotals>();
+    for (const entry of yearEntries) {
       const current = map.get(entry.class_code) ?? { debit: 0, credit: 0, count: 0 };
       current.debit += amount(entry.debit);
       current.credit += amount(entry.credit);
@@ -430,98 +511,404 @@ function App() {
       map.set(entry.class_code, current);
     }
     return map;
-  }, [journalEntries]);
+  }, [yearEntries]);
 
-  const classEntries = journalClass ? journalEntries.filter((entry) => entry.class_code === journalClass) : [];
-  const accounts = useMemo(() => [...new Set(classEntries.map((entry) => entry.account))].sort(), [classEntries]);
-  const visibleJournalEntries = journalAccount ? classEntries.filter((entry) => entry.account === journalAccount) : classEntries;
+  const classEntries = useMemo(
+    () => (journalClass ? yearEntries.filter((entry) => entry.class_code === journalClass) : []),
+    [journalClass, yearEntries],
+  );
+
+  const currentPrefix = journalPrefix ?? journalClass ?? "";
+  const prefixEntries = useMemo(
+    () =>
+      journalClass
+        ? classEntries.filter((entry) => entry.account.startsWith(currentPrefix))
+        : [],
+    [classEntries, currentPrefix, journalClass],
+  );
+
+  const childPrefixes = useMemo(() => {
+    if (!journalClass || journalAccount || currentPrefix.length >= 4) return [];
+    const nextLength = currentPrefix.length + 1;
+    return [
+      ...new Set(
+        prefixEntries
+          .map((entry) => entry.account)
+          .filter((accountCode) => accountCode.length > currentPrefix.length)
+          .map((accountCode) => accountCode.slice(0, nextLength)),
+      ),
+    ].sort();
+  }, [currentPrefix, journalAccount, journalClass, prefixEntries]);
+
+  const accountChoices = useMemo(
+    () => [...new Set(prefixEntries.map((entry) => entry.account))].sort(),
+    [prefixEntries],
+  );
+
+  const visibleJournalEntries = useMemo(
+    () =>
+      journalAccount
+        ? classEntries.filter((entry) => entry.account === journalAccount)
+        : prefixEntries,
+    [classEntries, journalAccount, prefixEntries],
+  );
+
+  const supplierTotals = useMemo(() => {
+    if (!journalAccount) return [];
+    const grouped = new Map<string, JournalTotals>();
+    for (const entry of visibleJournalEntries) {
+      const supplier = entry.supplier || "Sans fournisseur";
+      const current = grouped.get(supplier) ?? { debit: 0, credit: 0, count: 0 };
+      current.debit += amount(entry.debit);
+      current.credit += amount(entry.credit);
+      current.count += 1;
+      grouped.set(supplier, current);
+    }
+    return [...grouped.entries()].sort((left, right) => {
+      const leftAmount = Math.max(left[1].debit, left[1].credit);
+      const rightAmount = Math.max(right[1].debit, right[1].credit);
+      return rightAmount - leftAmount;
+    });
+  }, [journalAccount, visibleJournalEntries]);
+
+  const journalBreadcrumbs = useMemo(() => {
+    if (!journalClass) return [];
+    const prefixes: string[] = [];
+    const terminal = journalPrefix ?? journalClass;
+    for (let length = 2; length <= terminal.length; length += 1) {
+      prefixes.push(terminal.slice(0, length));
+    }
+    return prefixes;
+  }, [journalClass, journalPrefix]);
+
+  const openJournalClass = (code: string) => {
+    setJournalClass(code);
+    setJournalPrefix(null);
+    setJournalAccount(null);
+  };
+
+  const openJournalPrefix = (prefix: string) => {
+    setJournalPrefix(prefix);
+    setJournalAccount(null);
+  };
+
+  const journalBack = () => {
+    if (journalAccount) {
+      setJournalAccount(null);
+      return;
+    }
+    if (journalPrefix && journalPrefix.length > 2) {
+      const parent = journalPrefix.slice(0, -1);
+      setJournalPrefix(parent === journalClass ? null : parent);
+      return;
+    }
+    if (journalPrefix) {
+      setJournalPrefix(null);
+      return;
+    }
+    setJournalClass(null);
+  };
+
+  const resetJournal = () => {
+    setJournalClass(null);
+    setJournalPrefix(null);
+    setJournalAccount(null);
+  };
 
   const navigate = (target: Page) => {
     setPage(target);
     setBankPreview(null);
-    if (target !== "journal") {
-      setJournalClass(null);
-      setJournalAccount(null);
-    }
+    if (target !== "journal") resetJournal();
   };
+
+  const journalTitle = journalAccount
+    ? `Compte ${journalAccount}`
+    : journalPrefix
+      ? `Comptes ${journalPrefix}…`
+      : journalClass
+        ? `Classe ${journalClass} — ${classLabels[journalClass] ?? "Comptes"}`
+        : "Classes comptables";
+
+  const showAccountChoices = Boolean(
+    journalClass && !journalAccount && (currentPrefix.length >= 4 || childPrefixes.length === 0),
+  );
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><strong>Compta Collège</strong><span>Assistant Charlemagne</span></div>
+        <div className="brand">
+          <strong>Compta Collège</strong>
+          <span>Assistant Charlemagne</span>
+        </div>
         <nav>
           <button className={page === "accueil" ? "active" : ""} onClick={() => navigate("accueil")}>Accueil</button>
-          <button className={page === "factures" ? "active" : ""} onClick={() => navigate("factures")}><span>Factures</span><b>{pendingCount}</b></button>
-          <button className={page === "banque" ? "active" : ""} onClick={() => navigate("banque")}><span>Banque</span><b>{bankPending}</b></button>
+          <button className={page === "factures" ? "active" : ""} onClick={() => navigate("factures")}>
+            <span>Factures</span><b>{pendingCount}</b>
+          </button>
+          <button className={page === "banque" ? "active" : ""} onClick={() => navigate("banque")}>
+            <span>Banque</span><b>{bankPending}</b>
+          </button>
           <button className={page === "journal" ? "active" : ""} onClick={() => navigate("journal")}>Journal / Comptes</button>
           <button className={page === "parametres" ? "active" : ""} onClick={() => navigate("parametres")}>Paramètres</button>
         </nav>
-        <div className="safety-note">Mode sécurisé<br/><span>Aucun envoi définitif vers Charlemagne.</span></div>
+        <div className="safety-note">
+          Mode sécurisé<br />
+          <span>Aucun envoi définitif vers Charlemagne.</span>
+        </div>
       </aside>
 
       <div className="workspace">
         <header className="workspace-header">
-          <div><p className="eyebrow">Exercice comptable</p><h1>{page === "accueil" ? "Tableau de bord" : page === "factures" ? "Factures fournisseurs" : page === "banque" ? "Relevés bancaires" : page === "journal" ? "Journal / Comptes" : "Paramètres"}</h1></div>
+          <div>
+            <p className="eyebrow">Exercice comptable</p>
+            <h1>
+              {page === "accueil"
+                ? "Tableau de bord"
+                : page === "factures"
+                  ? "Factures fournisseurs"
+                  : page === "banque"
+                    ? "Relevés bancaires"
+                    : page === "journal"
+                      ? "Journal / Comptes"
+                      : "Paramètres"}
+            </h1>
+          </div>
           <span className="version-pill">TEST · V0.11</span>
         </header>
 
-        {message && <div className="global-message"><span>{message}</span><button onClick={() => setMessage(null)}>Fermer</button></div>}
+        {message && (
+          <div className="global-message">
+            <span>{message}</span>
+            <button onClick={() => setMessage(null)}>Fermer</button>
+          </div>
+        )}
 
         {page === "accueil" && (
           <>
             <section className="summary-grid">
-              <button onClick={() => navigate("factures")}><span>Factures à vérifier</span><strong>{pendingCount}</strong><small>{files.length} document(s) connus</small></button>
-              <button onClick={() => navigate("banque")}><span>Banque à traiter</span><strong>{bankPending}</strong><small>{bankFiles.length} relevé(s) connus</small></button>
-              <button onClick={() => navigate("journal")}><span>Écritures journal</span><strong>{journalEntries.length}</strong><small>{readyCharlemagneCount} facture(s) préparées</small></button>
-              <button className={errorCount > 0 ? "has-error" : ""} onClick={() => navigate("factures")}><span>Erreurs à traiter</span><strong>{errorCount}</strong><small>Archive ou préparation comptable</small></button>
+              <button onClick={() => navigate("factures")}>
+                <span>Factures à vérifier</span><strong>{pendingCount}</strong><small>{files.length} document(s) connus</small>
+              </button>
+              <button onClick={() => navigate("banque")}>
+                <span>Banque à traiter</span><strong>{bankPending}</strong><small>{bankFiles.length} relevé(s) connus</small>
+              </button>
+              <button onClick={() => navigate("journal")}>
+                <span>Écritures journal</span><strong>{journalEntries.length}</strong><small>{readyCharlemagneCount} facture(s) préparées</small>
+              </button>
+              <button className={errorCount > 0 ? "has-error" : ""} onClick={() => navigate("factures")}>
+                <span>Erreurs à traiter</span><strong>{errorCount}</strong><small>Archive ou préparation comptable</small>
+              </button>
             </section>
             <section className="source-grid">
-              <article className="source-card"><p className="eyebrow">Source 1</p><h2>Factures fournisseurs</h2><p>{watchedFolder ?? "Dossier non connecté"}</p><button onClick={() => navigate("factures")}>Ouvrir les factures</button></article>
-              <article className="source-card"><p className="eyebrow">Source 2</p><h2>Relevés bancaires</h2><p>{bankFolder ?? "Dossier non connecté"}</p><button onClick={() => navigate("banque")}>Ouvrir la banque</button></article>
+              <article className="source-card">
+                <p className="eyebrow">Source 1</p><h2>Factures fournisseurs</h2>
+                <p>{watchedFolder ?? "Dossier non connecté"}</p>
+                <button onClick={() => navigate("factures")}>Ouvrir les factures</button>
+              </article>
+              <article className="source-card">
+                <p className="eyebrow">Source 2</p><h2>Relevés bancaires</h2>
+                <p>{bankFolder ?? "Dossier non connecté"}</p>
+                <button onClick={() => navigate("banque")}>Ouvrir la banque</button>
+              </article>
             </section>
-            <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Circuit sécurisé</p><h2>Traitement automatique</h2></div></div><div className="pipeline"><span>PDF détecté</span><i>→</i><span>Lecture / OCR</span><i>→</i><span>Contrôle humain</span><i>→</i><span>Archivage vérifié</span><i>→</i><span>Journal</span></div></section>
+            <section className="panel">
+              <div className="panel-heading"><div><p className="eyebrow">Circuit sécurisé</p><h2>Traitement automatique</h2></div></div>
+              <div className="pipeline"><span>PDF détecté</span><i>→</i><span>Lecture / OCR</span><i>→</i><span>Contrôle humain</span><i>→</i><span>Archivage vérifié</span><i>→</i><span>Journal</span></div>
+            </section>
           </>
         )}
 
         {page === "factures" && (
           <>
-            <section className="source-bar"><div><p className="eyebrow">Source automatique Factures</p><strong>{watchedFolder ?? "Aucun dossier connecté"}</strong></div><button onClick={chooseInvoiceFolder}>{watchedFolder ? "Changer" : "Connecter"}</button></section>
-            <section className={`compact-dropzone ${dragging ? "is-dragging" : ""}`}><div><strong>Ajouter des factures PDF</strong><span>Glisser-déposer ou sélection manuelle</span></div><button onClick={chooseFiles}>Choisir des PDF</button></section>
-            <section className="panel"><div className="panel-heading"><div><h2>File Factures</h2><p>L'OCR démarre automatiquement si le PDF ne contient pas de texte exploitable.</p></div><span>{files.length}</span></div>
-              {files.length === 0 ? <div className="empty">Aucune facture.</div> : <div className="document-list">{files.map((file) => (
-                <article key={file.path} className="document-row"><div className="document-main"><strong>{file.file_name}</strong><small>{file.path}</small>{file.archive_error && <em>{file.archive_error}</em>}{file.charlemagne_error && <em>{file.charlemagne_error}</em>}<div className="row-actions">
-                  {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && file.status !== "classee" && file.status !== "doublon" && <button onClick={() => inspectInvoice(file)}>Contrôler</button>}
-                  {file.extraction_status === "ocr_requis" && <button disabled={busyPath === file.path} onClick={() => runOcr(file)}>{busyPath === file.path ? "OCR…" : "Réessayer OCR"}</button>}
-                  {file.status === "nouvelle" && <button disabled={busyPath === file.path} onClick={() => reanalyze(file)}>Relire</button>}
-                  {(file.status === "archive_erreur" || file.status === "archive_source_presente") && <button disabled={busyPath === file.path} onClick={() => retryArchive(file)}>Reprendre archivage</button>}
-                </div></div><div className="row-status"><span>{extractionLabel(file.extraction_status)}</span><b className={`status-${file.status}`}>{invoiceStatusLabel(file.status)}</b></div></article>
-              ))}</div>}
+            <section className="source-bar">
+              <div><p className="eyebrow">Source automatique Factures</p><strong>{watchedFolder ?? "Aucun dossier connecté"}</strong></div>
+              <button onClick={chooseInvoiceFolder}>{watchedFolder ? "Changer" : "Connecter"}</button>
+            </section>
+            <section className={`compact-dropzone ${dragging ? "is-dragging" : ""}`}>
+              <div><strong>Ajouter des factures PDF</strong><span>Glisser-déposer ou sélection manuelle</span></div>
+              <button onClick={chooseFiles}>Choisir des PDF</button>
+            </section>
+            <section className="panel">
+              <div className="panel-heading"><div><h2>File Factures</h2><p>L'OCR démarre automatiquement si le PDF ne contient pas de texte exploitable.</p></div><span>{files.length}</span></div>
+              {files.length === 0 ? (
+                <div className="empty">Aucune facture.</div>
+              ) : (
+                <div className="document-list">
+                  {files.map((file) => (
+                    <article key={file.path} className="document-row">
+                      <div className="document-main">
+                        <strong>{file.file_name}</strong><small>{file.path}</small>
+                        {file.archive_error && <em>{file.archive_error}</em>}
+                        {file.charlemagne_error && <em>{file.charlemagne_error}</em>}
+                        <div className="row-actions">
+                          {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && file.status !== "classee" && file.status !== "doublon" && (
+                            <button onClick={() => inspectInvoice(file)}>Contrôler</button>
+                          )}
+                          {file.extraction_status === "ocr_requis" && (
+                            <button disabled={busyPath === file.path} onClick={() => runOcr(file)}>{busyPath === file.path ? "OCR…" : "Réessayer OCR"}</button>
+                          )}
+                          {file.status === "nouvelle" && (
+                            <button disabled={busyPath === file.path} onClick={() => reanalyze(file)}>Relire</button>
+                          )}
+                          {(file.status === "archive_erreur" || file.status === "archive_source_presente") && (
+                            <button disabled={busyPath === file.path} onClick={() => retryArchive(file)}>Reprendre archivage</button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="row-status">
+                        <span>{extractionLabel(file.extraction_status)}</span>
+                        <b className={`status-${file.status}`}>{invoiceStatusLabel(file.status)}</b>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
             </section>
           </>
         )}
 
         {page === "banque" && (
           <>
-            <section className="source-bar bank"><div><p className="eyebrow">Source automatique Banque</p><strong>{bankFolder ?? "Aucun dossier connecté"}</strong></div><button onClick={chooseBankFolder}>{bankFolder ? "Changer" : "Connecter"}</button></section>
-            <section className="panel"><div className="panel-heading"><div><h2>Relevés mensuels</h2><p>Cette source est indépendante du dossier Factures. Doublons et fichiers en cours de copie sont contrôlés séparément.</p></div><span>{bankFiles.length}</span></div>
-              {bankFiles.length === 0 ? <div className="empty">Aucun relevé bancaire détecté.</div> : <div className="document-list">{bankFiles.map((file) => (
-                <article key={file.path} className="document-row"><div className="document-main"><strong>{file.file_name}</strong><small>{file.path}</small>{file.error && <em>{file.error}</em>}{file.duplicate_of && <small>Doublon de : {file.duplicate_of}</small>}<div className="row-actions">
-                  {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && <button onClick={() => inspectBank(file)}>Consulter</button>}
-                  {file.extraction_status === "ocr_requis" && <button disabled={busyPath === file.path} onClick={() => runBankOcr(file)}>{busyPath === file.path ? "OCR…" : "OCR relevé"}</button>}
-                </div></div><div className="row-status"><span>{extractionLabel(file.extraction_status)}</span><b>{file.status === "doublon" ? "Doublon" : "À rapprocher"}</b></div></article>
-              ))}</div>}
+            <section className="source-bar bank">
+              <div><p className="eyebrow">Source automatique Banque</p><strong>{bankFolder ?? "Aucun dossier connecté"}</strong></div>
+              <button onClick={chooseBankFolder}>{bankFolder ? "Changer" : "Connecter"}</button>
             </section>
-            {bankPreview && <section className="panel preview-panel"><div className="panel-heading"><h2>{bankPreview.name}</h2><button className="ghost" onClick={() => setBankPreview(null)}>Fermer</button></div><pre>{bankPreview.text}</pre></section>}
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Relevés mensuels</h2><p>Cette source est indépendante du dossier Factures. Doublons et fichiers en cours de copie sont contrôlés séparément.</p></div>
+                <span>{bankFiles.length}</span>
+              </div>
+              {bankFiles.length === 0 ? (
+                <div className="empty">Aucun relevé bancaire détecté.</div>
+              ) : (
+                <div className="document-list">
+                  {bankFiles.map((file) => (
+                    <article key={file.path} className="document-row">
+                      <div className="document-main">
+                        <strong>{file.file_name}</strong><small>{file.path}</small>
+                        {file.error && <em>{file.error}</em>}
+                        {file.duplicate_of && <small>Doublon de : {file.duplicate_of}</small>}
+                        <div className="row-actions">
+                          {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && (
+                            <button onClick={() => inspectBank(file)}>Consulter</button>
+                          )}
+                          {file.extraction_status === "ocr_requis" && (
+                            <button disabled={busyPath === file.path} onClick={() => runBankOcr(file)}>{busyPath === file.path ? "OCR…" : "OCR relevé"}</button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="row-status"><span>{extractionLabel(file.extraction_status)}</span><b>{file.status === "doublon" ? "Doublon" : "À rapprocher"}</b></div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+            {bankPreview && (
+              <section className="panel preview-panel">
+                <div className="panel-heading"><h2>{bankPreview.name}</h2><button className="ghost" onClick={() => setBankPreview(null)}>Fermer</button></div>
+                <pre>{bankPreview.text}</pre>
+              </section>
+            )}
           </>
         )}
 
         {page === "journal" && (
           <section className="panel journal-panel">
-            <div className="panel-heading"><div><h2>{journalClass ? `Classe ${journalClass} — ${classLabels[journalClass] ?? "Comptes"}` : "Classes comptables"}</h2><p>Vue construite à partir des factures validées et des écritures préparées. La synchronisation directe avec Charlemagne viendra avec le connecteur officiel.</p></div>{journalClass && <button className="ghost" onClick={() => { setJournalClass(null); setJournalAccount(null); }}>Toutes les classes</button>}</div>
-            {!journalClass ? <div className="class-grid">{Object.entries(classLabels).map(([code, label]) => { const totals = journalByClass.get(code) ?? { debit: 0, credit: 0, count: 0 }; return <button key={code} onClick={() => setJournalClass(code)}><div><strong>Classe {code}</strong><span>{label}</span></div><small>{totals.count} ligne(s)</small><b>Débit {euro(totals.debit)}</b><b>Crédit {euro(totals.credit)}</b></button>; })}</div> : (
+            <div className="panel-heading">
+              <div>
+                <h2>{journalTitle}</h2>
+                <p>Navigation : classe → famille → sous-compte → compte → écritures. Les données viennent des factures validées et préparées localement.</p>
+              </div>
+              <div className="row-actions">
+                <select value={journalYear} onChange={(event) => { setJournalYear(event.target.value); resetJournal(); }} aria-label="Exercice comptable">
+                  {availableYears.map((year) => <option key={year} value={year}>Exercice {year}</option>)}
+                  <option value="all">Tous les exercices</option>
+                </select>
+                {journalClass && <button className="ghost" onClick={journalBack}>Retour</button>}
+                {journalClass && <button className="ghost" onClick={resetJournal}>Toutes les classes</button>}
+              </div>
+            </div>
+
+            {journalClass && (
+              <div className="account-strip">
+                <button onClick={resetJournal}>Classes</button>
+                <button className={!journalPrefix && !journalAccount ? "active" : ""} onClick={() => { setJournalPrefix(null); setJournalAccount(null); }}>Classe {journalClass}</button>
+                {journalBreadcrumbs.map((prefix) => (
+                  <button key={prefix} className={journalPrefix === prefix && !journalAccount ? "active" : ""} onClick={() => openJournalPrefix(prefix)}>{prefix}</button>
+                ))}
+                {journalAccount && <button className="active" onClick={() => setJournalAccount(journalAccount)}>{journalAccount}</button>}
+              </div>
+            )}
+
+            {!journalClass ? (
+              <div className="class-grid">
+                {Object.entries(classLabels).map(([code, label]) => {
+                  const totals = journalByClass.get(code) ?? { debit: 0, credit: 0, count: 0 };
+                  return (
+                    <button key={code} onClick={() => openJournalClass(code)}>
+                      <div><strong>Classe {code}</strong><span>{label}</span></div>
+                      <small>{totals.count} ligne(s)</small>
+                      <b>Débit {euro(totals.debit)}</b><b>Crédit {euro(totals.credit)}</b>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : !journalAccount && childPrefixes.length > 0 ? (
+              <div className="class-grid">
+                {childPrefixes.map((prefix) => {
+                  const entries = prefixEntries.filter((entry) => entry.account.startsWith(prefix));
+                  const totals = totalsForEntries(entries);
+                  return (
+                    <button key={prefix} onClick={() => openJournalPrefix(prefix)}>
+                      <div><strong>{prefix}</strong><span>Comptes commençant par {prefix}</span></div>
+                      <small>{totals.count} ligne(s)</small>
+                      <b>Débit {euro(totals.debit)}</b><b>Crédit {euro(totals.credit)}</b>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : showAccountChoices ? (
+              <div className="class-grid">
+                {accountChoices.map((accountCode) => {
+                  const entries = classEntries.filter((entry) => entry.account === accountCode);
+                  const totals = totalsForEntries(entries);
+                  return (
+                    <button key={accountCode} onClick={() => setJournalAccount(accountCode)}>
+                      <div><strong>Compte {accountCode}</strong><span>{entries[0]?.label ?? "Écritures comptables"}</span></div>
+                      <small>{totals.count} ligne(s)</small>
+                      <b>Débit {euro(totals.debit)}</b><b>Crédit {euro(totals.credit)}</b>
+                    </button>
+                  );
+                })}
+                {accountChoices.length === 0 && <div className="empty">Aucun compte dans cette branche.</div>}
+              </div>
+            ) : (
               <>
-                <div className="account-strip"><button className={!journalAccount ? "active" : ""} onClick={() => setJournalAccount(null)}>Tous les comptes</button>{accounts.map((accountCode) => <button key={accountCode} className={journalAccount === accountCode ? "active" : ""} onClick={() => setJournalAccount(accountCode)}>{accountCode}</button>)}</div>
-                <div className="journal-table-wrap"><table><thead><tr><th>Date</th><th>Compte</th><th>Fournisseur</th><th>Facture</th><th>Libellé</th><th>Analytique</th><th>Débit</th><th>Crédit</th></tr></thead><tbody>{visibleJournalEntries.map((entry, index) => <tr key={`${entry.account}-${entry.invoice_number}-${index}`}><td>{entry.date}</td><td><strong>{entry.account}</strong></td><td>{entry.supplier}</td><td>{entry.invoice_number}</td><td>{entry.label}</td><td>{entry.analytic_code ?? "—"}</td><td className="number">{amount(entry.debit) ? euro(amount(entry.debit)) : "—"}</td><td className="number">{amount(entry.credit) ? euro(amount(entry.credit)) : "—"}</td></tr>)}</tbody></table>{visibleJournalEntries.length === 0 && <div className="empty">Aucune écriture dans cette classe pour le moment.</div>}</div>
+                {supplierTotals.length > 0 && (
+                  <div className="class-grid">
+                    {supplierTotals.map(([supplier, totals]) => (
+                      <button key={supplier} type="button">
+                        <div><strong>{supplier}</strong><span>{totals.count} écriture(s) sur l'exercice</span></div>
+                        <b>Débit {euro(totals.debit)}</b><b>Crédit {euro(totals.credit)}</b>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div className="journal-table-wrap">
+                  <table>
+                    <thead><tr><th>Date</th><th>Compte</th><th>Fournisseur</th><th>Facture</th><th>Libellé</th><th>Analytique</th><th>Débit</th><th>Crédit</th></tr></thead>
+                    <tbody>
+                      {visibleJournalEntries.map((entry, index) => (
+                        <tr key={`${entry.account}-${entry.invoice_number}-${index}`}>
+                          <td>{entry.date}</td><td><strong>{entry.account}</strong></td><td>{entry.supplier}</td><td>{entry.invoice_number}</td><td>{entry.label}</td><td>{entry.analytic_code ?? "—"}</td>
+                          <td className="number">{amount(entry.debit) ? euro(amount(entry.debit)) : "—"}</td>
+                          <td className="number">{amount(entry.credit) ? euro(amount(entry.credit)) : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {visibleJournalEntries.length === 0 && <div className="empty">Aucune écriture dans ce compte pour cet exercice.</div>}
+                </div>
               </>
             )}
           </section>
@@ -537,14 +924,46 @@ function App() {
         )}
 
         {selectedText !== null && (
-          <div className="modal-backdrop"><section className="review-modal"><div className="modal-heading"><div><p className="eyebrow">Contrôle humain</p><h2>{selectedName}</h2></div><button className="ghost" onClick={closeReview}>Fermer</button></div><div className="review-grid">
-            <div className="parsed-card"><div className="confidence">Confiance extraction : <strong>{parsed.confidence}%</strong></div><div className="form-grid">
-              <label>Fournisseur<input value={parsed.supplier ?? ""} onChange={(event) => setField("supplier", event.target.value)} /></label><label>N° facture<input value={parsed.invoice_number ?? ""} onChange={(event) => setField("invoice_number", event.target.value)} /></label><label>Date<input value={parsed.invoice_date ?? ""} onChange={(event) => setField("invoice_date", event.target.value)} /></label><label>HT<input value={parsed.amount_ht ?? ""} onChange={(event) => setField("amount_ht", event.target.value)} /></label><label>TVA<input value={parsed.amount_vat ?? ""} onChange={(event) => setField("amount_vat", event.target.value)} /></label><label>TTC<input value={parsed.amount_ttc ?? ""} onChange={(event) => setField("amount_ttc", event.target.value)} /></label><label>SIRET<input value={parsed.siret ?? ""} onChange={(event) => setField("siret", event.target.value)} /></label><label>IBAN<input value={parsed.iban ?? ""} onChange={(event) => setField("iban", event.target.value)} /></label>
-            </div><div className="accounting-card"><div className="accounting-heading"><div><strong>Imputation comptable</strong><span>{accounting.source === "regle_fournisseur" ? `Règle connue · ${accounting.confidence}%` : "À contrôler"}</span></div></div><div className="form-grid"><label>Compte fournisseur<input placeholder="401..." value={accounting.supplier_account ?? ""} onChange={(event) => setAccountingField("supplier_account", event.target.value)} /></label><label>Compte de charge<input placeholder="6..." value={accounting.expense_account ?? ""} onChange={(event) => setAccountingField("expense_account", event.target.value)} /></label><label>Compte TVA<input placeholder="445..." value={accounting.vat_account ?? ""} onChange={(event) => setAccountingField("vat_account", event.target.value)} /></label><label>Analytique<input value={accounting.analytic_code ?? ""} onChange={(event) => setAccountingField("analytic_code", event.target.value)} /></label></div><label className="checkbox"><input type="checkbox" checked={rememberRule} onChange={(event) => setRememberRule(event.target.checked)} />Mémoriser pour ce fournisseur</label></div>
-            <div className="accounting-card"><div className="accounting-heading"><div><strong>Archivage</strong><span>{storage.source === "regle_fournisseur" ? "Dossier appris" : "Destination à contrôler"}</span></div></div><div className="archive-choice"><span>{storage.archive_folder ?? "Aucun dossier sélectionné"}</span><button onClick={chooseArchiveFolder}>Choisir</button></div><label className="checkbox"><input type="checkbox" checked={rememberStorage} onChange={(event) => setRememberStorage(event.target.checked)} />Mémoriser le dossier</label></div>
-            <p className={`check ${parsed.amounts_consistent === true ? "ok" : parsed.amounts_consistent === false ? "bad" : "neutral"}`}>{parsed.amounts_consistent === true ? "HT + TVA = TTC" : parsed.amounts_consistent === false ? "HT + TVA ne correspond pas au TTC" : "Montants à compléter"}</p><button className="validate" disabled={busyPath === selectedPath} onClick={validate}>{busyPath === selectedPath ? "VALIDATION…" : storage.archive_folder ? "VALIDER ET CLASSER" : "VALIDER"}</button></div>
-            <div className="text-preview"><pre>{selectedText}</pre></div>
-          </div></section></div>
+          <div className="modal-backdrop">
+            <section className="review-modal">
+              <div className="modal-heading"><div><p className="eyebrow">Contrôle humain</p><h2>{selectedName}</h2></div><button className="ghost" onClick={closeReview}>Fermer</button></div>
+              <div className="review-grid">
+                <div className="parsed-card">
+                  <div className="confidence">Confiance extraction : <strong>{parsed.confidence}%</strong></div>
+                  <div className="form-grid">
+                    <label>Fournisseur<input value={parsed.supplier ?? ""} onChange={(event) => setField("supplier", event.target.value)} /></label>
+                    <label>N° facture<input value={parsed.invoice_number ?? ""} onChange={(event) => setField("invoice_number", event.target.value)} /></label>
+                    <label>Date<input value={parsed.invoice_date ?? ""} onChange={(event) => setField("invoice_date", event.target.value)} /></label>
+                    <label>HT<input value={parsed.amount_ht ?? ""} onChange={(event) => setField("amount_ht", event.target.value)} /></label>
+                    <label>TVA<input value={parsed.amount_vat ?? ""} onChange={(event) => setField("amount_vat", event.target.value)} /></label>
+                    <label>TTC<input value={parsed.amount_ttc ?? ""} onChange={(event) => setField("amount_ttc", event.target.value)} /></label>
+                    <label>SIRET<input value={parsed.siret ?? ""} onChange={(event) => setField("siret", event.target.value)} /></label>
+                    <label>IBAN<input value={parsed.iban ?? ""} onChange={(event) => setField("iban", event.target.value)} /></label>
+                  </div>
+                  <div className="accounting-card">
+                    <div className="accounting-heading"><div><strong>Imputation comptable</strong><span>{accounting.source === "regle_fournisseur" ? `Règle connue · ${accounting.confidence}%` : "À contrôler"}</span></div></div>
+                    <div className="form-grid">
+                      <label>Compte fournisseur<input placeholder="401..." value={accounting.supplier_account ?? ""} onChange={(event) => setAccountingField("supplier_account", event.target.value)} /></label>
+                      <label>Compte de charge<input placeholder="6..." value={accounting.expense_account ?? ""} onChange={(event) => setAccountingField("expense_account", event.target.value)} /></label>
+                      <label>Compte TVA<input placeholder="445..." value={accounting.vat_account ?? ""} onChange={(event) => setAccountingField("vat_account", event.target.value)} /></label>
+                      <label>Analytique<input value={accounting.analytic_code ?? ""} onChange={(event) => setAccountingField("analytic_code", event.target.value)} /></label>
+                    </div>
+                    <label className="checkbox"><input type="checkbox" checked={rememberRule} onChange={(event) => setRememberRule(event.target.checked)} />Mémoriser pour ce fournisseur</label>
+                  </div>
+                  <div className="accounting-card">
+                    <div className="accounting-heading"><div><strong>Archivage</strong><span>{storage.source === "regle_fournisseur" ? "Dossier appris" : "Destination à contrôler"}</span></div></div>
+                    <div className="archive-choice"><span>{storage.archive_folder ?? "Aucun dossier sélectionné"}</span><button onClick={chooseArchiveFolder}>Choisir</button></div>
+                    <label className="checkbox"><input type="checkbox" checked={rememberStorage} onChange={(event) => setRememberStorage(event.target.checked)} />Mémoriser le dossier</label>
+                  </div>
+                  <p className={`check ${parsed.amounts_consistent === true ? "ok" : parsed.amounts_consistent === false ? "bad" : "neutral"}`}>
+                    {parsed.amounts_consistent === true ? "HT + TVA = TTC" : parsed.amounts_consistent === false ? "HT + TVA ne correspond pas au TTC" : "Montants à compléter"}
+                  </p>
+                  <button className="validate" disabled={busyPath === selectedPath} onClick={validate}>{busyPath === selectedPath ? "VALIDATION…" : storage.archive_folder ? "VALIDER ET CLASSER" : "VALIDER"}</button>
+                </div>
+                <div className="text-preview"><pre>{selectedText}</pre></div>
+              </div>
+            </section>
+          </div>
         )}
       </div>
     </main>
