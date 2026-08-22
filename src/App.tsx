@@ -10,6 +10,8 @@ type InvoiceRecord = {
   status: string;
   extraction_status: string;
   text_length: number;
+  archive_path: string | null;
+  archive_error: string | null;
 };
 
 type ParsedInvoice = {
@@ -40,6 +42,12 @@ type StorageAssignment = {
   confidence: number;
   source: string;
   use_count: number;
+};
+
+type ArchiveResult = {
+  archive_path: string;
+  content_hash: string;
+  source_deleted: boolean;
 };
 
 const emptyParsed: ParsedInvoice = {
@@ -79,6 +87,14 @@ const extractionLabel = (status: string) => {
   if (status === "ocr_requis") return "OCR requis";
   if (status === "ocr_termine") return "OCR terminé";
   return "À analyser";
+};
+
+const invoiceStatusLabel = (status: string) => {
+  if (status === "validee") return "Validée";
+  if (status === "classee") return "Classée";
+  if (status === "archive_erreur") return "Erreur archive";
+  if (status === "archive_source_presente") return "Archivée · source présente";
+  return "À vérifier";
 };
 
 function App() {
@@ -174,6 +190,8 @@ function App() {
     try {
       await invoke("analyze_invoice", { path: file.path });
       await refreshInvoices();
+    } catch (error) {
+      setFolderError(`Analyse : ${String(error)}`);
     } finally {
       setBusyPath(null);
     }
@@ -186,6 +204,20 @@ function App() {
       await refreshInvoices();
     } catch (error) {
       setFolderError(`OCR : ${String(error)}`);
+    } finally {
+      setBusyPath(null);
+    }
+  };
+
+  const retryArchive = async (file: InvoiceRecord) => {
+    setBusyPath(file.path);
+    try {
+      await invoke<ArchiveResult>("archive_invoice", { path: file.path });
+      setFolderError(null);
+      await refreshInvoices();
+    } catch (error) {
+      setFolderError(`Archivage : ${String(error)}`);
+      await refreshInvoices();
     } finally {
       setBusyPath(null);
     }
@@ -225,17 +257,7 @@ function App() {
     setAccounting((current) => ({ ...current, [field]: value || null, source: "manuel" }));
   };
 
-  const validate = async () => {
-    if (!selectedPath) return;
-    await invoke("validate_invoice", {
-      path: selectedPath,
-      data: parsed,
-      accounting,
-      storage,
-      rememberRule,
-      rememberStorage,
-    });
-    await refreshInvoices();
+  const closeReview = () => {
     setSelectedText(null);
     setSelectedName(null);
     setSelectedPath(null);
@@ -243,22 +265,59 @@ function App() {
     setStorage(emptyStorage);
   };
 
+  const validate = async () => {
+    if (!selectedPath) return;
+    const invoicePath = selectedPath;
+    setBusyPath(invoicePath);
+    try {
+      await invoke("validate_invoice", {
+        path: invoicePath,
+        data: parsed,
+        accounting,
+        storage,
+        rememberRule,
+        rememberStorage,
+      });
+
+      if (storage.archive_folder) {
+        try {
+          const result = await invoke<ArchiveResult>("archive_invoice", { path: invoicePath });
+          if (!result.source_deleted) {
+            setFolderError(`Archive vérifiée : ${result.archive_path}. Le fichier source n'a pas pu être supprimé.`);
+          } else {
+            setFolderError(null);
+          }
+        } catch (error) {
+          setFolderError(`Facture validée, mais archivage impossible : ${String(error)}`);
+        }
+      }
+
+      await refreshInvoices();
+      closeReview();
+    } catch (error) {
+      setFolderError(`Validation : ${String(error)}`);
+    } finally {
+      setBusyPath(null);
+    }
+  };
+
   const pendingCount = files.filter((file) => file.status === "nouvelle").length;
-  const validatedCount = files.filter((file) => file.status === "validee").length;
+  const validatedCount = files.filter((file) => ["validee", "classee", "archive_source_presente"].includes(file.status)).length;
+  const archivedCount = files.filter((file) => file.status === "classee").length;
   const ocrCount = files.filter((file) => file.extraction_status === "ocr_requis").length;
 
   return (
     <main className="shell">
       <header className="topbar">
         <div><p className="eyebrow">Assistant Charlemagne</p><h1>Factures fournisseurs</h1></div>
-        <span className="status">V0.8 · Classement appris</span>
+        <span className="status">V0.9 · Archivage vérifié</span>
       </header>
 
       <section className="stats">
         <article><strong>{files.length}</strong><span>Factures enregistrées</span></article>
         <article><strong>{pendingCount}</strong><span>À vérifier</span></article>
         <article><strong>{ocrCount}</strong><span>OCR requis</span></article>
-        <article><strong>{validatedCount}</strong><span>Validées</span></article>
+        <article><strong>{archivedCount}/{validatedCount}</strong><span>Classées / validées</span></article>
       </section>
 
       <section className="folder-card">
@@ -275,14 +334,22 @@ function App() {
         {files.length === 0 ? <div className="empty">Aucune facture enregistrée.</div> : (
           <ul>{files.map((file) => (
             <li key={file.path}>
-              <div className="file-info"><strong>{file.file_name}</strong><small>{file.path} · source : {file.source}</small>
+              <div className="file-info">
+                <strong>{file.file_name}</strong>
+                <small>{file.path} · source : {file.source}</small>
+                {file.archive_path && <small className="archive-success">Archive : {file.archive_path}</small>}
+                {file.archive_error && <small className="archive-failure">Erreur : {file.archive_error}</small>}
                 <div className="file-actions">
-                  {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && <button type="button" className="secondary" onClick={() => inspectInvoice(file)}>Contrôler</button>}
-                  {file.extraction_status === "ocr_requis" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => runOcr(file)}>{busyPath === file.path ? "OCR…" : "Lancer OCR"}</button>}
-                  <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => reanalyze(file)}>Réanalyser</button>
+                  {(file.extraction_status === "texte_extrait" || file.extraction_status === "ocr_termine") && file.status !== "classee" && <button type="button" className="secondary" onClick={() => inspectInvoice(file)}>Contrôler</button>}
+                  {file.extraction_status === "ocr_requis" && file.status === "nouvelle" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => runOcr(file)}>{busyPath === file.path ? "OCR…" : "Lancer OCR"}</button>}
+                  {file.status === "nouvelle" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => reanalyze(file)}>Réanalyser</button>}
+                  {file.status === "archive_erreur" && <button type="button" className="secondary" disabled={busyPath === file.path} onClick={() => retryArchive(file)}>{busyPath === file.path ? "Archivage…" : "Réessayer archivage"}</button>}
                 </div>
               </div>
-              <div className="badges"><span className={`extraction ${file.extraction_status}`}>{extractionLabel(file.extraction_status)}{file.text_length > 0 ? ` · ${file.text_length} car.` : ""}</span><span className="pending">{file.status}</span></div>
+              <div className="badges">
+                <span className={`extraction ${file.extraction_status}`}>{extractionLabel(file.extraction_status)}{file.text_length > 0 ? ` · ${file.text_length} car.` : ""}</span>
+                <span className={`pending status-${file.status}`}>{invoiceStatusLabel(file.status)}</span>
+              </div>
             </li>
           ))}</ul>
         )}
@@ -290,43 +357,43 @@ function App() {
 
       {selectedText !== null && (
         <section className="review-panel">
-          <div className="section-heading"><h2>Contrôle · {selectedName}</h2><button type="button" className="secondary" onClick={() => setSelectedText(null)}>Fermer</button></div>
+          <div className="section-heading"><h2>Contrôle · {selectedName}</h2><button type="button" className="secondary" onClick={closeReview}>Fermer</button></div>
           <div className="review-grid">
             <div className="parsed-card">
               <div className="confidence">Confiance extraction initiale : <strong>{parsed.confidence}%</strong></div>
               <div className="form-grid">
-                <label>Fournisseur<input value={parsed.supplier ?? ""} onChange={(e) => setField("supplier", e.target.value)} /></label>
-                <label>N° facture<input value={parsed.invoice_number ?? ""} onChange={(e) => setField("invoice_number", e.target.value)} /></label>
-                <label>Date<input value={parsed.invoice_date ?? ""} onChange={(e) => setField("invoice_date", e.target.value)} /></label>
-                <label>HT<input value={parsed.amount_ht ?? ""} onChange={(e) => setField("amount_ht", e.target.value)} /></label>
-                <label>TVA<input value={parsed.amount_vat ?? ""} onChange={(e) => setField("amount_vat", e.target.value)} /></label>
-                <label>TTC<input value={parsed.amount_ttc ?? ""} onChange={(e) => setField("amount_ttc", e.target.value)} /></label>
-                <label>SIRET<input value={parsed.siret ?? ""} onChange={(e) => setField("siret", e.target.value)} /></label>
-                <label>IBAN<input value={parsed.iban ?? ""} onChange={(e) => setField("iban", e.target.value)} /></label>
+                <label>Fournisseur<input value={parsed.supplier ?? ""} onChange={(event) => setField("supplier", event.target.value)} /></label>
+                <label>N° facture<input value={parsed.invoice_number ?? ""} onChange={(event) => setField("invoice_number", event.target.value)} /></label>
+                <label>Date<input value={parsed.invoice_date ?? ""} onChange={(event) => setField("invoice_date", event.target.value)} /></label>
+                <label>HT<input value={parsed.amount_ht ?? ""} onChange={(event) => setField("amount_ht", event.target.value)} /></label>
+                <label>TVA<input value={parsed.amount_vat ?? ""} onChange={(event) => setField("amount_vat", event.target.value)} /></label>
+                <label>TTC<input value={parsed.amount_ttc ?? ""} onChange={(event) => setField("amount_ttc", event.target.value)} /></label>
+                <label>SIRET<input value={parsed.siret ?? ""} onChange={(event) => setField("siret", event.target.value)} /></label>
+                <label>IBAN<input value={parsed.iban ?? ""} onChange={(event) => setField("iban", event.target.value)} /></label>
               </div>
 
               <div className="accounting-card">
                 <div className="accounting-heading"><div><strong>Imputation comptable</strong><span>{accounting.source === "regle_fournisseur" ? `Règle connue · confiance ${accounting.confidence}%` : "À renseigner"}</span></div></div>
                 <div className="form-grid accounting-grid">
-                  <label>Compte fournisseur<input placeholder="401..." value={accounting.supplier_account ?? ""} onChange={(e) => setAccountingField("supplier_account", e.target.value)} /></label>
-                  <label>Compte de charge<input placeholder="6..." value={accounting.expense_account ?? ""} onChange={(e) => setAccountingField("expense_account", e.target.value)} /></label>
-                  <label>Compte TVA<input placeholder="445..." value={accounting.vat_account ?? ""} onChange={(e) => setAccountingField("vat_account", e.target.value)} /></label>
-                  <label>Analytique<input placeholder="Code analytique" value={accounting.analytic_code ?? ""} onChange={(e) => setAccountingField("analytic_code", e.target.value)} /></label>
+                  <label>Compte fournisseur<input placeholder="401..." value={accounting.supplier_account ?? ""} onChange={(event) => setAccountingField("supplier_account", event.target.value)} /></label>
+                  <label>Compte de charge<input placeholder="6..." value={accounting.expense_account ?? ""} onChange={(event) => setAccountingField("expense_account", event.target.value)} /></label>
+                  <label>Compte TVA<input placeholder="445..." value={accounting.vat_account ?? ""} onChange={(event) => setAccountingField("vat_account", event.target.value)} /></label>
+                  <label>Analytique<input placeholder="Code analytique" value={accounting.analytic_code ?? ""} onChange={(event) => setAccountingField("analytic_code", event.target.value)} /></label>
                 </div>
-                <label className="remember-rule"><input type="checkbox" checked={rememberRule} onChange={(e) => setRememberRule(e.target.checked)} /> Mémoriser cette imputation pour ce fournisseur</label>
+                <label className="remember-rule"><input type="checkbox" checked={rememberRule} onChange={(event) => setRememberRule(event.target.checked)} /> Mémoriser cette imputation pour ce fournisseur</label>
               </div>
 
               <div className="accounting-card">
                 <div className="accounting-heading"><div><strong>Classement Windows</strong><span>{storage.source === "regle_fournisseur" ? `Dossier connu · confiance ${storage.confidence}%` : "Choisir un dossier d'archive existant"}</span></div></div>
                 <div className="archive-row">
-                  <div className="archive-path">{storage.archive_folder ?? "Aucun dossier d'archive sélectionné."}</div>
+                  <div className="archive-path">{storage.archive_folder ?? "Aucun dossier d'archive sélectionné. La facture sera validée sans être déplacée."}</div>
                   <button type="button" className="secondary" onClick={chooseArchiveFolder}>Choisir</button>
                 </div>
-                <label className="remember-rule"><input type="checkbox" checked={rememberStorage} onChange={(e) => setRememberStorage(e.target.checked)} /> Mémoriser ce dossier pour ce fournisseur</label>
+                <label className="remember-rule"><input type="checkbox" checked={rememberStorage} onChange={(event) => setRememberStorage(event.target.checked)} /> Mémoriser ce dossier pour ce fournisseur</label>
               </div>
 
               <p className={`check ${parsed.amounts_consistent === true ? "ok" : parsed.amounts_consistent === false ? "bad" : "neutral"}`}>{parsed.amounts_consistent === true ? "✓ HT + TVA = TTC" : parsed.amounts_consistent === false ? "⚠ HT + TVA ≠ TTC" : "Montants incomplets : contrôle à faire"}</p>
-              <button type="button" className="validate" onClick={validate}>VALIDER LA FACTURE</button>
+              <button type="button" className="validate" disabled={busyPath === selectedPath} onClick={validate}>{busyPath === selectedPath ? "VALIDATION…" : storage.archive_folder ? "VALIDER ET CLASSER" : "VALIDER LA FACTURE"}</button>
             </div>
             <div className="text-preview-inline"><pre>{selectedText}</pre></div>
           </div>
