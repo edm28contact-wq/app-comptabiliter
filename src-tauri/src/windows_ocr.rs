@@ -28,11 +28,11 @@ fn ocr_local_pdf(path: &Path) -> Result<String, String> {
     let path_string = path.to_string_lossy().into_owned();
     let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path_string))
         .map_err(|error| error.to_string())?
-        .get()
+        .join()
         .map_err(|error| error.to_string())?;
     let document = PdfDocument::LoadFromFileAsync(&file)
         .map_err(|error| error.to_string())?
-        .get()
+        .join()
         .map_err(|error| error.to_string())?;
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()
         .map_err(|error| error.to_string())?;
@@ -44,23 +44,23 @@ fn ocr_local_pdf(path: &Path) -> Result<String, String> {
         let stream = InMemoryRandomAccessStream::new().map_err(|error| error.to_string())?;
         page.RenderToStreamAsync(&stream)
             .map_err(|error| error.to_string())?
-            .get()
+            .join()
             .map_err(|error| error.to_string())?;
         stream.Seek(0).map_err(|error| error.to_string())?;
 
         let decoder = BitmapDecoder::CreateAsync(&stream)
             .map_err(|error| error.to_string())?
-            .get()
+            .join()
             .map_err(|error| error.to_string())?;
         let bitmap = decoder
             .GetSoftwareBitmapConvertedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied)
             .map_err(|error| error.to_string())?
-            .get()
+            .join()
             .map_err(|error| error.to_string())?;
         let result = engine
             .RecognizeAsync(&bitmap)
             .map_err(|error| error.to_string())?
-            .get()
+            .join()
             .map_err(|error| error.to_string())?;
         let page_text = result.Text().map_err(|error| error.to_string())?.to_string_lossy();
 
