@@ -41,12 +41,12 @@ li strong, li small { display: block; }
 li small { max-width: 720px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8a94a3; }
 .file-info { min-width: 0; flex: 1; }
 .archive-success { color: #287244; }
-.archive-failure { color: #a12b2b; }
+.archive-failure, .charlemagne-failure { color: #a12b2b; }
 .file-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .secondary { border: 1px solid #d8dee8; background: white; color: #344054; border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px; font-weight: 700; }
 .secondary:disabled, .validate:disabled { opacity: .55; cursor: default; }
 .badges { display: flex; align-items: flex-end; flex-direction: column; gap: 7px; }
-.pending, .extraction { padding: 6px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.pending, .extraction, .charlemagne { padding: 6px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; white-space: nowrap; }
 .pending { background: #fff5d9; color: #8a6500; }
 .status-validee { background: #eef2ff; color: #315efb; }
 .status-classee { background: #e9f8ef; color: #287244; }
@@ -55,6 +55,9 @@ li small { max-width: 720px; margin-top: 4px; overflow: hidden; text-overflow: e
 .extraction { background: #eef1f5; color: #556070; }
 .extraction.texte_extrait, .extraction.ocr_termine { background: #e9f8ef; color: #287244; }
 .extraction.ocr_requis { background: #fff0e6; color: #9a4c16; }
+.charlemagne { background: #eef1f5; color: #556070; }
+.charlemagne.pret { background: #e9f8ef; color: #287244; }
+.charlemagne.incomplet { background: #fdecec; color: #a12b2b; }
 .review-grid { display: grid; grid-template-columns: minmax(400px, .95fr) minmax(0, 1.35fr); min-height: 430px; }
 .parsed-card { padding: 20px; border-right: 1px solid #eef1f5; }
 .confidence { padding: 10px 12px; margin-bottom: 16px; border-radius: 10px; background: #f5f7fb; color: #556070; font-size: 14px; }
