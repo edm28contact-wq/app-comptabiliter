@@ -31,5 +31,9 @@ jobs:
       - name: Check frontend
         run: npm run build
 
+      - name: Test Rust
+        working-directory: src-tauri
+        run: cargo test
+
       - name: Build Tauri executable
         run: npm run tauri build -- --debug --no-bundle
