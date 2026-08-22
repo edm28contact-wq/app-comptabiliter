@@ -1,10 +1,12 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashSet},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process,
+    sync::{mpsc, Mutex, OnceLock},
     thread,
+    time::Duration,
 };
 use windows::{
     core::HSTRING,
@@ -17,6 +19,8 @@ use windows::{
 };
 
 const OCR_RENDER_LONG_EDGE: f32 = 1400.0;
+const OCR_TIMEOUT_SECONDS: u64 = 60;
+static ACTIVE_OCR: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 struct WinRtGuard;
 
@@ -33,6 +37,36 @@ impl WinRtGuard {
 impl Drop for WinRtGuard {
     fn drop(&mut self) {
         unsafe { RoUninitialize() };
+    }
+}
+
+struct ActiveOcrGuard {
+    source: String,
+}
+
+impl ActiveOcrGuard {
+    fn acquire(source: &str) -> Result<Self, String> {
+        let active = ACTIVE_OCR.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = active
+            .lock()
+            .map_err(|_| "Le verrou OCR Windows est indisponible.".to_string())?;
+        if !guard.insert(source.to_string()) {
+            return Err("L'OCR de ce document est déjà en cours. Attendez sa fin avant de réessayer."
+                .to_string());
+        }
+        Ok(Self {
+            source: source.to_string(),
+        })
+    }
+}
+
+impl Drop for ActiveOcrGuard {
+    fn drop(&mut self) {
+        if let Some(active) = ACTIVE_OCR.get() {
+            if let Ok(mut guard) = active.lock() {
+                guard.remove(&self.source);
+            }
+        }
     }
 }
 
@@ -109,7 +143,10 @@ fn ocr_local_pdf(path: &Path) -> Result<String, String> {
             .map_err(|error| error.to_string())?
             .join()
             .map_err(|error| error.to_string())?;
-        let page_text = result.Text().map_err(|error| error.to_string())?.to_string_lossy();
+        let page_text = result
+            .Text()
+            .map_err(|error| error.to_string())?
+            .to_string_lossy();
 
         if !page_text.trim().is_empty() {
             if !output.is_empty() {
@@ -130,21 +167,35 @@ pub fn ocr_pdf(source: &str) -> Result<String, String> {
         return Err("Le PDF n'est plus accessible.".to_string());
     }
 
+    let active_guard = ActiveOcrGuard::acquire(source)?;
     let temporary_path = temporary_pdf_path(source);
     fs::copy(source_path, &temporary_path)
         .map_err(|error| format!("Impossible de préparer le PDF pour l'OCR Windows : {error}"))?;
 
     let worker_path = temporary_path.clone();
-    let worker = thread::Builder::new()
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
         .name("app-comptabiliter-ocr".to_string())
-        .spawn(move || ocr_local_pdf(&worker_path))
-        .map_err(|error| format!("Impossible de démarrer le moteur OCR : {error}"))?;
+        .spawn(move || {
+            let _active_guard = active_guard;
+            let result = ocr_local_pdf(&worker_path);
+            let _ = fs::remove_file(&worker_path);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            let _ = fs::remove_file(&temporary_path);
+            format!("Impossible de démarrer le moteur OCR : {error}")
+        })?;
 
-    let result = worker
-        .join()
-        .map_err(|_| "Le moteur OCR Windows s'est arrêté de manière inattendue.".to_string())?;
-    let _ = fs::remove_file(&temporary_path);
-    result
+    match receiver.recv_timeout(Duration::from_secs(OCR_TIMEOUT_SECONDS)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "L'OCR dépasse {OCR_TIMEOUT_SECONDS} secondes. Il continue en arrière-plan mais l'application a repris la main."
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("Le moteur OCR Windows s'est arrêté de manière inattendue.".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
