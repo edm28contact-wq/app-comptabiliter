@@ -2,11 +2,10 @@
 
 include!("lib.rs");
 mod bank;
+mod bank_workspace;
 mod charlemagne_connector;
-mod charlemagne_journal;
 mod charlemagne_sync;
 mod ingestion;
-mod workspace;
 
 fn main() {
     let _ = bank::check_statement;
@@ -42,13 +41,13 @@ fn main() {
             charlemagne_sync::get_charlemagne_sync_summary,
             charlemagne_sync::list_charlemagne_accounts,
             charlemagne_sync::list_charlemagne_suppliers,
-            charlemagne_journal::list_journal_entries,
-            workspace::get_bank_watched_folder,
-            workspace::set_bank_watched_folder,
-            workspace::scan_bank_folder,
-            workspace::list_bank_documents,
-            workspace::run_bank_ocr,
-            workspace::get_bank_document_text
+            charlemagne_sync::list_journal_entries,
+            bank_workspace::get_bank_watched_folder,
+            bank_workspace::set_bank_watched_folder,
+            bank_workspace::scan_bank_folder,
+            bank_workspace::list_bank_documents,
+            bank_workspace::run_bank_ocr,
+            bank_workspace::get_bank_document_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
