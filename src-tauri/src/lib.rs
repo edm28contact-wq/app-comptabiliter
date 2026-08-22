@@ -3,7 +3,13 @@ mod windows_ocr;
 use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tauri::{AppHandle, Manager};
 
 #[derive(Serialize)]
@@ -14,6 +20,8 @@ struct InvoiceRecord {
     status: String,
     extraction_status: String,
     text_length: i64,
+    archive_path: Option<String>,
+    archive_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -49,6 +57,13 @@ struct StorageAssignment {
     use_count: i64,
 }
 
+#[derive(Serialize)]
+struct ArchiveResult {
+    archive_path: String,
+    content_hash: String,
+    source_deleted: bool,
+}
+
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
     fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
@@ -56,11 +71,18 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn ensure_column(connection: &Connection, table: &str, column: &str, definition: &str) -> Result<(), String> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})")).map_err(|error| error.to_string())?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1)).map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
     if !columns.iter().any(|existing| existing == column) {
-        connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []).map_err(|error| error.to_string())?;
+        connection
+            .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -70,27 +92,55 @@ fn open_database(app: &AppHandle) -> Result<Connection, String> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS invoices (
-            path TEXT PRIMARY KEY, file_name TEXT NOT NULL, source TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'nouvelle', first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, extracted_text TEXT,
-            extraction_status TEXT NOT NULL DEFAULT 'a_analyser', extraction_error TEXT,
-            text_length INTEGER NOT NULL DEFAULT 0, parsed_json TEXT, validated_json TEXT,
-            validated_accounting_json TEXT, validated_storage_json TEXT, validated_at TEXT
+            path TEXT PRIMARY KEY,
+            file_name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'nouvelle',
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            extracted_text TEXT,
+            extraction_status TEXT NOT NULL DEFAULT 'a_analyser',
+            extraction_error TEXT,
+            text_length INTEGER NOT NULL DEFAULT 0,
+            parsed_json TEXT,
+            validated_json TEXT,
+            validated_accounting_json TEXT,
+            validated_storage_json TEXT,
+            validated_at TEXT,
+            original_path TEXT,
+            archive_path TEXT,
+            content_hash TEXT,
+            archive_error TEXT,
+            archived_at TEXT
          );
          CREATE TABLE IF NOT EXISTS supplier_accounting_rules (
-            supplier_key TEXT PRIMARY KEY, supplier_name TEXT NOT NULL, supplier_account TEXT,
-            expense_account TEXT, vat_account TEXT, analytic_code TEXT,
-            use_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            supplier_key TEXT PRIMARY KEY,
+            supplier_name TEXT NOT NULL,
+            supplier_account TEXT,
+            expense_account TEXT,
+            vat_account TEXT,
+            analytic_code TEXT,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );
          CREATE TABLE IF NOT EXISTS supplier_storage_rules (
-            supplier_key TEXT PRIMARY KEY, supplier_name TEXT NOT NULL, archive_folder TEXT NOT NULL,
-            use_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            supplier_key TEXT PRIMARY KEY,
+            supplier_name TEXT NOT NULL,
+            archive_folder TEXT NOT NULL,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );"
     ).map_err(|error| error.to_string())?;
+
     ensure_column(&connection, "invoices", "validated_json", "TEXT")?;
     ensure_column(&connection, "invoices", "validated_accounting_json", "TEXT")?;
     ensure_column(&connection, "invoices", "validated_storage_json", "TEXT")?;
     ensure_column(&connection, "invoices", "validated_at", "TEXT")?;
+    ensure_column(&connection, "invoices", "original_path", "TEXT")?;
+    ensure_column(&connection, "invoices", "archive_path", "TEXT")?;
+    ensure_column(&connection, "invoices", "content_hash", "TEXT")?;
+    ensure_column(&connection, "invoices", "archive_error", "TEXT")?;
+    ensure_column(&connection, "invoices", "archived_at", "TEXT")?;
     Ok(connection)
 }
 
@@ -174,7 +224,7 @@ fn get_supplier_rule(connection: &Connection, supplier: &str) -> Result<Option<A
     let supplier_key = normalize_supplier_key(supplier);
     if supplier_key.is_empty() { return Ok(None); }
     match connection.query_row(
-        "SELECT supplier_account, expense_account, vat_account, analytic_code, use_count FROM supplier_accounting_rules WHERE supplier_key=?1",
+        "SELECT supplier_account,expense_account,vat_account,analytic_code,use_count FROM supplier_accounting_rules WHERE supplier_key=?1",
         params![supplier_key],
         |row| {
             let use_count: i64 = row.get(4)?;
@@ -238,6 +288,95 @@ fn save_storage_rule(connection: &Connection, supplier: &str, storage: &StorageA
     Ok(())
 }
 
+fn sanitize_filename_component(value: &str, fallback: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() { fallback.to_string() } else { trimmed.chars().take(80).collect() }
+}
+
+fn normalize_date_for_filename(value: Option<&str>) -> String {
+    let Some(value) = value else { return "date-inconnue".to_string(); };
+    let parts: Vec<&str> = value.split(|character| character == '/' || character == '.' || character == '-').collect();
+    if parts.len() == 3 {
+        let day = parts[0].trim();
+        let month = parts[1].trim();
+        let year = parts[2].trim();
+        if day.len() <= 2 && month.len() <= 2 && (year.len() == 2 || year.len() == 4) {
+            let full_year = if year.len() == 2 { format!("20{year}") } else { year.to_string() };
+            return format!("{full_year}-{:0>2}-{:0>2}", month, day);
+        }
+    }
+    sanitize_filename_component(value, "date-inconnue")
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 { break; }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn unique_archive_path(folder: &Path, file_name: &str) -> PathBuf {
+    let desired = folder.join(file_name);
+    if !desired.exists() { return desired; }
+    let stem = Path::new(file_name).file_stem().and_then(|value| value.to_str()).unwrap_or("facture");
+    let extension = Path::new(file_name).extension().and_then(|value| value.to_str()).unwrap_or("pdf");
+    for index in 2..10_000 {
+        let candidate = folder.join(format!("{stem}_{index}.{extension}"));
+        if !candidate.exists() { return candidate; }
+    }
+    folder.join(format!("{stem}_collision.{extension}"))
+}
+
+fn build_archive_name(data: &ParsedInvoice) -> String {
+    let date = normalize_date_for_filename(data.invoice_date.as_deref());
+    let supplier = sanitize_filename_component(data.supplier.as_deref().unwrap_or("fournisseur"), "fournisseur");
+    let number = sanitize_filename_component(data.invoice_number.as_deref().unwrap_or("sans-numero"), "sans-numero");
+    let amount = sanitize_filename_component(data.amount_ttc.as_deref().unwrap_or("montant-inconnu"), "montant-inconnu");
+    format!("{date}_{supplier}_{number}_{amount}EUR.pdf")
+}
+
+fn copy_verified(source: &Path, destination: &Path) -> Result<(String, bool), String> {
+    let source_hash = file_sha256(source)?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_millis();
+    let temp_name = format!(".{}.{}.part", destination.file_name().and_then(|value| value.to_str()).unwrap_or("facture.pdf"), timestamp);
+    let temp_path = destination.parent().ok_or_else(|| "Dossier de destination invalide.".to_string())?.join(temp_name);
+
+    let copy_result = (|| -> Result<(), String> {
+        let mut input = File::open(source).map_err(|error| error.to_string())?;
+        let mut output = File::create(&temp_path).map_err(|error| error.to_string())?;
+        std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+        output.flush().map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())?;
+        let copied_hash = file_sha256(&temp_path)?;
+        if copied_hash != source_hash {
+            return Err("La copie d'archive ne correspond pas au fichier source (SHA-256 différent).".to_string());
+        }
+        fs::rename(&temp_path, destination).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    let source_deleted = fs::remove_file(source).is_ok();
+    Ok((source_hash, source_deleted))
+}
+
 fn persist_text_and_parse(connection: &Connection, path: &str, text: &str, extraction_status: &str) -> Result<(), String> {
     let parsed = parse_invoice_text(text);
     let json = serde_json::to_string(&parsed).map_err(|error| error.to_string())?;
@@ -263,7 +402,10 @@ fn extract_native_text(connection: &Connection, path: &str) -> Result<(), String
 
 fn store_invoice(connection: &Connection, path: &str, source: &str) -> Result<(), String> {
     let file_name = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_string();
-    let inserted = connection.execute("INSERT OR IGNORE INTO invoices (path,file_name,source) VALUES (?1,?2,?3)",params![path,file_name,source]).map_err(|error| error.to_string())? > 0;
+    let inserted = connection.execute(
+        "INSERT OR IGNORE INTO invoices (path,file_name,source,original_path) VALUES (?1,?2,?3,?1)",
+        params![path,file_name,source],
+    ).map_err(|error| error.to_string())? > 0;
     if inserted { extract_native_text(connection,path)?; }
     Ok(())
 }
@@ -342,7 +484,7 @@ fn validate_invoice(app: AppHandle, path: String, mut data: ParsedInvoice, accou
     let accounting_json = serde_json::to_string(&accounting).map_err(|error| error.to_string())?;
     let storage_json = serde_json::to_string(&storage).map_err(|error| error.to_string())?;
     connection.execute(
-        "UPDATE invoices SET validated_json=?2,validated_accounting_json=?3,validated_storage_json=?4,validated_at=CURRENT_TIMESTAMP,status='validee',updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+        "UPDATE invoices SET validated_json=?2,validated_accounting_json=?3,validated_storage_json=?4,validated_at=CURRENT_TIMESTAMP,status='validee',archive_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
         params![path,invoice_json,accounting_json,storage_json],
     ).map_err(|error| error.to_string())?;
     if let Some(supplier) = data.supplier.as_deref() {
@@ -353,10 +495,61 @@ fn validate_invoice(app: AppHandle, path: String, mut data: ParsedInvoice, accou
 }
 
 #[tauri::command]
+fn archive_invoice(app: AppHandle, path: String) -> Result<ArchiveResult, String> {
+    let connection = open_database(&app)?;
+    let row: (String, Option<String>, Option<String>) = connection.query_row(
+        "SELECT status,validated_json,validated_storage_json FROM invoices WHERE path=?1",
+        params![path],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).map_err(|error| error.to_string())?;
+
+    if row.0 != "validee" && row.0 != "archive_erreur" && row.0 != "archive_source_presente" {
+        return Err("La facture doit être validée avant son archivage.".to_string());
+    }
+    let invoice_json = row.1.ok_or_else(|| "Données validées absentes.".to_string())?;
+    let storage_json = row.2.ok_or_else(|| "Destination d'archive absente.".to_string())?;
+    let data: ParsedInvoice = serde_json::from_str(&invoice_json).map_err(|error| error.to_string())?;
+    let storage: StorageAssignment = serde_json::from_str(&storage_json).map_err(|error| error.to_string())?;
+    let folder_value = storage.archive_folder.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        .ok_or_else(|| "Aucun dossier d'archive n'a été sélectionné.".to_string())?;
+    let folder = Path::new(folder_value);
+    if !folder.is_dir() { return Err("Le dossier d'archive n'est pas accessible.".to_string()); }
+
+    let source = Path::new(&path);
+    if !source.is_file() { return Err("Le fichier source n'est plus accessible.".to_string()); }
+    let archive_name = build_archive_name(&data);
+    let destination = unique_archive_path(folder,&archive_name);
+
+    match copy_verified(source,&destination) {
+        Ok((content_hash,source_deleted)) => {
+            let destination_string = destination.to_string_lossy().into_owned();
+            let new_status = if source_deleted { "classee" } else { "archive_source_presente" };
+            connection.execute(
+                "UPDATE invoices SET original_path=COALESCE(original_path,path),archive_path=?2,content_hash=?3,archive_error=NULL,archived_at=CURRENT_TIMESTAMP,status=?4,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+                params![path,destination_string,content_hash,new_status],
+            ).map_err(|error| error.to_string())?;
+            Ok(ArchiveResult { archive_path: destination.to_string_lossy().into_owned(), content_hash, source_deleted })
+        }
+        Err(error) => {
+            connection.execute(
+                "UPDATE invoices SET status='archive_erreur',archive_error=?2,updated_at=CURRENT_TIMESTAMP WHERE path=?1",
+                params![path,error],
+            ).map_err(|database_error| database_error.to_string())?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
 fn list_invoices(app: AppHandle) -> Result<Vec<InvoiceRecord>, String> {
     let connection = open_database(&app)?;
-    let mut statement = connection.prepare("SELECT path,file_name,source,status,extraction_status,text_length FROM invoices ORDER BY first_seen_at DESC,file_name ASC").map_err(|error| error.to_string())?;
-    let rows = statement.query_map([],|row| Ok(InvoiceRecord { path: row.get(0)?,file_name: row.get(1)?,source: row.get(2)?,status: row.get(3)?,extraction_status: row.get(4)?,text_length: row.get(5)? })).map_err(|error| error.to_string())?;
+    let mut statement = connection.prepare(
+        "SELECT path,file_name,source,status,extraction_status,text_length,archive_path,archive_error FROM invoices ORDER BY first_seen_at DESC,file_name ASC"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map([],|row| Ok(InvoiceRecord {
+        path: row.get(0)?, file_name: row.get(1)?, source: row.get(2)?, status: row.get(3)?, extraction_status: row.get(4)?,
+        text_length: row.get(5)?, archive_path: row.get(6)?, archive_error: row.get(7)?,
+    })).map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|error| error.to_string())
 }
 
@@ -379,6 +572,6 @@ pub fn run() {
     tauri::Builder::default().plugin(tauri_plugin_dialog::init()).invoke_handler(tauri::generate_handler![
         get_watched_folder,set_watched_folder,register_invoice,analyze_invoice,run_invoice_ocr,
         get_invoice_text,get_invoice_parsed,get_supplier_accounting,get_supplier_storage,validate_invoice,
-        list_invoices,scan_pdf_folder
+        archive_invoice,list_invoices,scan_pdf_folder
     ]).run(tauri::generate_context!()).expect("error while running tauri application");
 }
