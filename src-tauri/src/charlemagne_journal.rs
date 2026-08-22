@@ -27,7 +27,27 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
-    Connection::open(database_path(app)?).map_err(|error| error.to_string())
+    let connection = Connection::open(database_path(app)?).map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(
+            "PRAGMA busy_timeout=5000;
+             CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(connection)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn class_label(code: char) -> &'static str {
@@ -73,7 +93,8 @@ pub fn list_journal_entries(app: AppHandle) -> Result<Vec<JournalEntryRow>, Stri
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let use_mirror = mode.as_deref().unwrap_or("sync_files_v2") == "sync_files_v2";
+    let mirror_exists = table_exists(&connection, "charlemagne_mirror_entries")?;
+    let use_mirror = mode.as_deref().unwrap_or("sync_files_v2") == "sync_files_v2" && mirror_exists;
 
     let mut entries = Vec::new();
     let mut mirror_keys = HashSet::new();
@@ -145,12 +166,15 @@ pub fn list_journal_entries(app: AppHandle) -> Result<Vec<JournalEntryRow>, Stri
         }
     }
 
-    if let Ok(mut statement) = connection.prepare(
-        "SELECT prepared_charlemagne_json FROM invoices
-         WHERE prepared_charlemagne_json IS NOT NULL
-           AND status IN ('validee','classee','archive_source_presente')
-         ORDER BY validated_at ASC",
-    ) {
+    if table_exists(&connection, "invoices")? {
+        let mut statement = connection
+            .prepare(
+                "SELECT prepared_charlemagne_json FROM invoices
+                 WHERE prepared_charlemagne_json IS NOT NULL
+                   AND status IN ('validee','classee','archive_source_presente')
+                 ORDER BY validated_at ASC",
+            )
+            .map_err(|error| error.to_string())?;
         let json_rows = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
@@ -198,4 +222,17 @@ pub fn list_journal_entries(app: AppHandle) -> Result<Vec<JournalEntryRow>, Stri
             .then(left.invoice_number.cmp(&right.invoice_number))
     });
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_key;
+
+    #[test]
+    fn journal_dedupe_normalizes_amounts() {
+        assert_eq!(
+            dedupe_key("23/08/2026", "606300", "F1", "10,00", "0"),
+            dedupe_key("23/08/2026", "606300", "F1", "10.00", "0.00")
+        );
+    }
 }
