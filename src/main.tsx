@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import CharlemagneMode from "./CharlemagneMode";
+import StrictReviewGate from "./StrictReviewGate";
 import "./styles.css";
 
 function Root() {
@@ -16,6 +17,7 @@ function Root() {
   return (
     <>
       <App key={appRevision} />
+      <StrictReviewGate />
       <CharlemagneMode />
     </>
   );
