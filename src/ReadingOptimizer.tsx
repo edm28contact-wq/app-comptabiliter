@@ -17,6 +17,13 @@ type FocusedOptimizationResult = {
   errors: number;
 };
 
+type NativeNormalizationResult = {
+  inspected: number;
+  normalized: number;
+  skipped: number;
+  errors: number;
+};
+
 export default function ReadingOptimizer() {
   const busy = useRef(false);
 
@@ -27,6 +34,12 @@ export default function ReadingOptimizer() {
       if (stopped || busy.current) return;
       busy.current = true;
       try {
+        // Les PDF avec une vraie couche texte sont d'abord normalisés avec les
+        // formats réels observés dans le corpus fournisseur. Cela évite un OCR
+        // inutile et conserve les chiffres exacts du PDF quand ils existent.
+        const native = await invoke<NativeNormalizationResult>(
+          "normalize_native_invoice_texts",
+        );
         const result = await invoke<OptimizationResult>("optimize_invoice_readings");
         const focused = await invoke<FocusedOptimizationResult>(
           "optimize_focused_invoice_reading",
@@ -43,7 +56,10 @@ export default function ReadingOptimizer() {
 
         if (
           !stopped &&
-          (result.changed > 0 || focused.improved > 0 || secondPassChanged > 0)
+          (native.normalized > 0 ||
+            result.changed > 0 ||
+            focused.improved > 0 ||
+            secondPassChanged > 0)
         ) {
           window.dispatchEvent(new Event("invoice-reading-updated"));
         }
