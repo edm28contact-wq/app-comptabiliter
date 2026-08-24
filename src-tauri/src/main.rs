@@ -9,6 +9,7 @@ mod charlemagne_sync;
 mod ingestion;
 mod receipt;
 mod reading_optimizer;
+mod ocr_focused;
 
 fn main() {
     let _ = bank::check_statement;
