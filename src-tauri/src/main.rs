@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 include!("lib.rs");
+mod archive_workspace;
 mod bank;
 mod bank_workspace;
 mod charlemagne_connector;
@@ -43,6 +44,9 @@ fn main() {
             receipt::enhance_invoice_receipt,
             reading_optimizer::optimize_invoice_readings,
             ocr_focused::optimize_focused_invoice_reading,
+            archive_workspace::list_archive_workspace,
+            archive_workspace::list_archive_rules,
+            archive_workspace::set_invoice_archive_destination,
             charlemagne_connector::get_charlemagne_connector_status,
             charlemagne_connector::set_charlemagne_connector_mode,
             charlemagne_sync::get_charlemagne_sync_folder,
