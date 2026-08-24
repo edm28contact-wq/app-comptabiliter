@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import ArchiveWorkspace from "./ArchiveWorkspace";
 import CharlemagneMode from "./CharlemagneMode";
 import ReadingOptimizer from "./ReadingOptimizer";
 import StrictReviewGate from "./StrictReviewGate";
@@ -22,6 +23,7 @@ function Root() {
   return (
     <>
       <App key={appRevision} />
+      <ArchiveWorkspace />
       <ReadingOptimizer />
       <StrictReviewGate />
       <CharlemagneMode />
