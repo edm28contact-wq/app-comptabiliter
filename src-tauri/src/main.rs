@@ -40,6 +40,7 @@ fn main() {
             scan_pdf_folder,
             receipt::enhance_invoice_receipt,
             reading_optimizer::optimize_invoice_readings,
+            ocr_focused::optimize_focused_invoice_reading,
             charlemagne_connector::get_charlemagne_connector_status,
             charlemagne_connector::set_charlemagne_connector_mode,
             charlemagne_sync::get_charlemagne_sync_folder,
