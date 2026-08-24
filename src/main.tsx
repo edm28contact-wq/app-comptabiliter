@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import CharlemagneMode from "./CharlemagneMode";
+import ReadingOptimizer from "./ReadingOptimizer";
 import StrictReviewGate from "./StrictReviewGate";
 import "./styles.css";
 
@@ -11,12 +12,17 @@ function Root() {
   useEffect(() => {
     const refresh = () => setAppRevision((revision) => revision + 1);
     window.addEventListener("charlemagne-sync-updated", refresh);
-    return () => window.removeEventListener("charlemagne-sync-updated", refresh);
+    window.addEventListener("invoice-reading-updated", refresh);
+    return () => {
+      window.removeEventListener("charlemagne-sync-updated", refresh);
+      window.removeEventListener("invoice-reading-updated", refresh);
+    };
   }, []);
 
   return (
     <>
       <App key={appRevision} />
+      <ReadingOptimizer />
       <StrictReviewGate />
       <CharlemagneMode />
     </>
