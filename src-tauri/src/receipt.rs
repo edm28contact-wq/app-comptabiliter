@@ -56,6 +56,7 @@ fn parse_money(value: &str) -> Option<f64> {
         .replace("eur", "")
         .replace("CAD", "")
         .replace("USD", "")
+        .replace("GBP", "")
         .replace('\u{00a0}', "")
         .replace('\u{202f}', "")
         .replace(' ', "");
@@ -110,18 +111,18 @@ fn parse_date(value: &str) -> Option<String> {
         }
     }
     let french = Regex::new(r"\b(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})\b").ok()?;
-    if let Some(captures) = french.captures(value) {
-        let day = captures.get(1)?.as_str().parse::<u32>().ok()?;
-        let month = captures.get(2)?.as_str().parse::<u32>().ok()?;
-        let mut year = captures.get(3)?.as_str().parse::<u32>().ok()?;
-        if captures.get(3)?.as_str().len() == 2 {
-            year += 2000;
-        }
-        if (1..=12).contains(&month) && (1..=31).contains(&day) {
-            return Some(format!("{day:02}/{month:02}/{year:04}"));
-        }
+    let captures = french.captures(value)?;
+    let day = captures.get(1)?.as_str().parse::<u32>().ok()?;
+    let month = captures.get(2)?.as_str().parse::<u32>().ok()?;
+    let mut year = captures.get(3)?.as_str().parse::<u32>().ok()?;
+    if captures.get(3)?.as_str().len() == 2 {
+        year += 2000;
     }
-    None
+    if (1..=12).contains(&month) && (1..=31).contains(&day) && (1900..=2100).contains(&year) {
+        Some(format!("{day:02}/{month:02}/{year:04}"))
+    } else {
+        None
+    }
 }
 
 fn receipt_signal(text: &str) -> bool {
@@ -138,9 +139,14 @@ fn receipt_signal(text: &str) -> bool {
         "rendumonnaie",
         "mercidevotrevisite",
         "mercidevotreachat",
+        "totalapayer",
     ]
     .iter()
     .any(|needle| body.contains(needle))
+}
+
+pub fn is_receipt_like(text: &str) -> bool {
+    receipt_signal(text)
 }
 
 fn merchant_line_is_usable(line: &str) -> bool {
@@ -150,40 +156,21 @@ fn merchant_line_is_usable(line: &str) -> bool {
     }
     let value = normalize(trimmed);
     let blocked = [
-        "ticket",
-        "receipt",
-        "recu",
-        "facture",
-        "date",
-        "heure",
-        "caisse",
-        "caissier",
-        "siret",
-        "siren",
-        "tva",
-        "total",
-        "sous-total",
-        "subtotal",
-        "montant",
-        "paiement",
-        "carte",
-        "cb ",
-        "especes",
-        "rendu",
-        "monnaie",
-        "merci",
-        "tel",
-        "telephone",
-        "www",
-        "http",
-        "adresse",
+        "ticket", "receipt", "recu", "facture", "date", "heure", "caisse", "caissier",
+        "siret", "siren", "tva", "total", "sous-total", "subtotal", "montant", "paiement",
+        "carte", "especes", "rendu", "monnaie", "merci", "tel", "telephone", "www",
+        "http", "adresse",
     ];
     if blocked.iter().any(|needle| value.contains(needle)) {
         return false;
     }
     let letters = trimmed.chars().filter(|character| character.is_alphabetic()).count();
     let digits = trimmed.chars().filter(|character| character.is_ascii_digit()).count();
-    letters >= 2 && digits <= 8 && !trimmed.contains('€') && !trimmed.contains('$')
+    letters >= 2
+        && digits <= 8
+        && !trimmed.contains('€')
+        && !trimmed.contains('$')
+        && !trimmed.contains('£')
 }
 
 fn infer_merchant(text: &str) -> Option<String> {
@@ -198,12 +185,15 @@ fn infer_merchant(text: &str) -> Option<String> {
         if !merchant_line_is_usable(line) {
             continue;
         }
-        let letters = line.chars().filter(|character| character.is_alphabetic()).collect::<Vec<_>>();
-        let uppercase = letters.iter().filter(|character| character.is_uppercase()).count();
+        let letters = line
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .collect::<Vec<_>>();
         let uppercase_ratio = if letters.is_empty() {
             0.0
         } else {
-            uppercase as f32 / letters.len() as f32
+            letters.iter().filter(|character| character.is_uppercase()).count() as f32
+                / letters.len() as f32
         };
         let mut score = 100 - index as i32 * 6;
         if uppercase_ratio >= 0.65 {
@@ -238,7 +228,7 @@ fn extract_document_number(text: &str) -> Option<String> {
             .and_then(|captures| captures.get(1))
             .map(|value| value.as_str().trim().to_string())
         {
-            if value.len() >= 3 && value.len() <= 40 {
+            if (3..=40).contains(&value.len()) {
                 return Some(value);
             }
         }
@@ -274,7 +264,25 @@ fn is_ht_line(line: &str) -> bool {
     .any(|needle| key.contains(needle))
 }
 
+fn is_explicit_total_line(line: &str) -> bool {
+    let key = compact(line);
+    [
+        "totalttc",
+        "netapayer",
+        "totalapayer",
+        "montantapayer",
+        "grandtotal",
+        "amountdue",
+        "balancedue",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
 fn payment_or_noise_line(line: &str) -> bool {
+    if is_explicit_total_line(line) {
+        return false;
+    }
     let key = compact(line);
     [
         "rendu",
@@ -306,18 +314,18 @@ fn payment_or_noise_line(line: &str) -> bool {
 
 fn total_score(line: &str, index: usize, total_lines: usize) -> Option<i32> {
     let key = compact(line);
-    if payment_or_noise_line(line) || is_ht_line(line) {
+    if is_ht_line(line) || payment_or_noise_line(line) {
         return None;
     }
     if key.contains("tva") || key.contains("vat") || key.contains("tax") {
         return None;
     }
     let mut score = if key.contains("totalttc") || key.contains("netapayer") {
-        130
+        140
     } else if key.contains("totalapayer") || key.contains("montantapayer") {
-        120
-    } else if key.contains("grandtotal") || key.contains("amountdue") {
-        115
+        135
+    } else if key.contains("grandtotal") || key.contains("amountdue") || key.contains("balancedue") {
+        125
     } else if key.starts_with("total") || key.ends_with("total") || key.contains("total") {
         90
     } else {
@@ -338,9 +346,7 @@ fn extract_ttc(text: &str) -> Option<f64> {
         .iter()
         .enumerate()
         .filter_map(|(index, line)| {
-            let score = total_score(line, index, lines.len())?;
-            let amount = last_amount(line)?;
-            Some((score, amount))
+            Some((total_score(line, index, lines.len())?, last_amount(line)?))
         })
         .max_by_key(|(score, _)| *score)
         .map(|(_, amount)| amount)
@@ -366,23 +372,34 @@ fn extract_tax(text: &str) -> Option<f64> {
         return explicit_total;
     }
 
-    let mut taxes = Vec::new();
+    let mut tax_buckets = std::collections::HashMap::<String, f64>::new();
     for line in text.lines() {
         let key = compact(line);
-        let is_tax = ["tva", "vat", "tax", "gst", "qst", "hst", "tps", "tvq", "mwst", "iva", "btw"]
+        let bucket = ["tva", "vat", "gst", "qst", "hst", "tps", "tvq", "mwst", "iva", "btw"]
             .iter()
-            .any(|needle| key.contains(needle));
-        if !is_tax || key.contains("numero") || key.contains("ident") {
+            .find(|needle| key.contains(**needle))
+            .map(|value| (*value).to_string());
+        let Some(bucket) = bucket else {
+            continue;
+        };
+        if key.contains("numero") || key.contains("ident") || is_explicit_total_line(line) {
             continue;
         }
         if let Some(amount) = last_amount(line) {
-            taxes.push(amount);
+            tax_buckets
+                .entry(bucket)
+                .and_modify(|existing| {
+                    if amount.abs() > existing.abs() {
+                        *existing = amount;
+                    }
+                })
+                .or_insert(amount);
         }
     }
-    if taxes.is_empty() {
+    if tax_buckets.is_empty() {
         None
     } else {
-        let sum = taxes.iter().sum::<f64>();
+        let sum = tax_buckets.values().sum::<f64>();
         (sum.abs() > 0.0001).then_some(sum)
     }
 }
@@ -425,9 +442,12 @@ fn analyze(text: &str) -> ReceiptHints {
     }
 }
 
-fn augment_text(text: &str) -> String {
+pub fn augment_if_receipt(text: &str) -> String {
     let hints = analyze(text);
     if !hints.is_receipt {
+        return text.to_string();
+    }
+    if text.contains("--- TICKET DE CAISSE NORMALISE ---") {
         return text.to_string();
     }
     let mut result = String::new();
@@ -473,11 +493,10 @@ pub fn enhance_invoice_receipt(app: AppHandle, path: String) -> Result<bool, Str
     let Some(text) = text else {
         return Ok(false);
     };
-    let hints = analyze(&text);
-    if !hints.is_receipt {
+    if !is_receipt_like(&text) {
         return Ok(false);
     }
-    let augmented = augment_text(&text);
+    let augmented = augment_if_receipt(&text);
     let parsed = super::parse_invoice_text(&augmented);
     let json = serde_json::to_string(&parsed).map_err(|error| error.to_string())?;
     let length = augmented
@@ -490,18 +509,19 @@ pub fn enhance_invoice_receipt(app: AppHandle, path: String) -> Result<bool, Str
             params![path, augmented, length, json],
         )
         .map_err(|error| error.to_string())?;
+    let merchant = analyze(&text).merchant;
     let _ = super::record_audit(
         &connection,
         Some(&path),
         "receipt_enhanced",
-        hints.merchant.as_deref(),
+        merchant.as_deref(),
     );
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze, augment_text};
+    use super::{analyze, augment_if_receipt};
 
     #[test]
     fn reads_french_supermarket_receipt() {
@@ -531,8 +551,16 @@ mod tests {
         assert_eq!(hints.amount_vat, Some(2.0));
         assert_eq!(hints.amount_ttc, Some(22.0));
         assert_eq!(hints.amount_ht, Some(20.0));
-        let augmented = augment_text(text);
+        let augmented = augment_if_receipt(text);
         assert!(augmented.contains("Total HT : 20.00"));
         assert!(augmented.contains("Total TTC : 22.00"));
+    }
+
+    #[test]
+    fn does_not_duplicate_normalized_block() {
+        let text = "MAGASIN TEST\nTICKET A-42\n23/08/2026\nTOTAL TTC 12,00 €";
+        let once = augment_if_receipt(text);
+        let twice = augment_if_receipt(&once);
+        assert_eq!(twice.matches("--- TICKET DE CAISSE NORMALISE ---").count(), 1);
     }
 }
