@@ -10,6 +10,7 @@ mod ingestion;
 mod receipt;
 mod reading_optimizer;
 mod ocr_focused;
+mod document_normalizer;
 
 fn main() {
     let _ = bank::check_statement;
@@ -38,6 +39,7 @@ fn main() {
             archive_invoice,
             list_invoices,
             scan_pdf_folder,
+            document_normalizer::normalize_native_invoice_texts,
             receipt::enhance_invoice_receipt,
             reading_optimizer::optimize_invoice_readings,
             ocr_focused::optimize_focused_invoice_reading,
