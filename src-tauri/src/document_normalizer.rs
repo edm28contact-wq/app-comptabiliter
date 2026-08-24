@@ -660,7 +660,7 @@ pub fn normalize_native_invoice_texts(app: AppHandle) -> Result<NativeNormalizat
 
 #[cfg(test)]
 mod tests {
-    use super::{augment_text, strong_fields};
+    use super::{augment_text, strong_fields, MARKER};
 
     #[test]
     fn reads_darty_style_invoice_without_ocr() {
