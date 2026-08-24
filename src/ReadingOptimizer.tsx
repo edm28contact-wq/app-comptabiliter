@@ -10,6 +10,13 @@ type OptimizationResult = {
   errors: number;
 };
 
+type FocusedOptimizationResult = {
+  inspected: number;
+  processed: number;
+  improved: number;
+  errors: number;
+};
+
 export default function ReadingOptimizer() {
   const busy = useRef(false);
 
@@ -21,12 +28,28 @@ export default function ReadingOptimizer() {
       busy.current = true;
       try {
         const result = await invoke<OptimizationResult>("optimize_invoice_readings");
-        if (!stopped && result.changed > 0) {
+        const focused = await invoke<FocusedOptimizationResult>(
+          "optimize_focused_invoice_reading",
+        );
+
+        // Une passe focalisée peut révéler de nouveaux champs. On repasse
+        // immédiatement dans le moteur de fusion/cohérence pour éviter
+        // d'attendre le prochain cycle de 3 secondes.
+        let secondPassChanged = 0;
+        if (focused.improved > 0) {
+          const second = await invoke<OptimizationResult>("optimize_invoice_readings");
+          secondPassChanged = second.changed;
+        }
+
+        if (
+          !stopped &&
+          (result.changed > 0 || focused.improved > 0 || secondPassChanged > 0)
+        ) {
           window.dispatchEvent(new Event("invoice-reading-updated"));
         }
       } catch {
-        // Le flux principal garde ses propres erreurs visibles. L'optimiseur
-        // est opportuniste et ne doit jamais bloquer l'interface.
+        // Le flux principal garde ses propres erreurs visibles. Les optimisations
+        // avancées restent opportunistes et ne doivent jamais bloquer l'interface.
       } finally {
         busy.current = false;
       }
