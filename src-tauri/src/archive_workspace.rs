@@ -153,8 +153,8 @@ fn collect_archive_folders(root: &Path) -> Result<(Vec<CatalogFolder>, bool), St
         let name = folder
             .file_name()
             .and_then(|value| value.to_str())
-            .unwrap_or_else(|| folder.to_string_lossy().as_ref())
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| folder.to_string_lossy().into_owned());
         let path = folder.to_string_lossy().into_owned();
         folders.push(CatalogFolder {
             normalized_name: compact(&name),
@@ -248,10 +248,10 @@ fn suggestion_score(supplier: &str, folder: &CatalogFolder) -> i32 {
         return 88 - (folder.depth.min(5) as i32);
     }
     if direct_matches > 0 {
-        return 65 + ((direct_matches * 20) / supplier_tokens.len()) as i32;
+        return 70 + ((direct_matches * 25) / supplier_tokens.len()) as i32;
     }
     if path_matches > 0 {
-        return 55 + ((path_matches * 18) / supplier_tokens.len()) as i32;
+        return 60 + ((path_matches * 20) / supplier_tokens.len()) as i32;
     }
     if folder.normalized_path.contains(&supplier_compact) {
         return 86 - (folder.depth.min(5) as i32);
@@ -262,7 +262,6 @@ fn suggestion_score(supplier: &str, folder: &CatalogFolder) -> i32 {
 fn suggest_existing_folder(catalog: &[CatalogFolder], supplier: &str) -> Option<(String, i32)> {
     catalog
         .iter()
-        .filter(|folder| Path::new(&folder.path).is_dir())
         .map(|folder| (folder.path.clone(), suggestion_score(supplier, folder)))
         .filter(|(_, score)| *score >= 72)
         .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.len().cmp(&left.0.len())))
@@ -288,6 +287,7 @@ pub fn set_archive_root(app: AppHandle, path: String) -> Result<ArchiveScanResul
             params![ARCHIVE_ROOT_KEY, root.to_string_lossy().as_ref()],
         )
         .map_err(|error| error.to_string())?;
+    drop(connection);
     scan_archive_tree(app)
 }
 
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn picks_existing_supplier_folder_over_generic_parent() {
+    fn picks_supplier_folder_over_generic_parent() {
         let catalog = vec![
             folder(r"C:\Archives", "Archives", 0),
             folder(r"C:\Archives\2026", "2026", 1),
