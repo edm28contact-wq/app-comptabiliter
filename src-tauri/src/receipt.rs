@@ -359,6 +359,32 @@ fn extract_ht(text: &str) -> Option<f64> {
         .last()
 }
 
+fn tax_family(key: &str) -> Option<&'static str> {
+    [
+        ("tva", "TVA"),
+        ("vat", "VAT"),
+        ("gst", "GST"),
+        ("qst", "QST"),
+        ("hst", "HST"),
+        ("tps", "TPS"),
+        ("tvq", "TVQ"),
+        ("mwst", "MWST"),
+        ("iva", "IVA"),
+        ("btw", "BTW"),
+    ]
+    .iter()
+    .find(|(needle, _)| key.contains(needle))
+    .map(|(_, family)| *family)
+}
+
+fn tax_rate_signature(line: &str) -> Option<String> {
+    let regex = Regex::new(r"(?i)(\d{1,2}(?:[,.]\d{1,3})?)\s*%").ok()?;
+    regex
+        .captures(line)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().replace(',', "."))
+}
+
 fn extract_tax(text: &str) -> Option<f64> {
     let explicit_total = text.lines().find_map(|line| {
         let key = compact(line);
@@ -372,34 +398,31 @@ fn extract_tax(text: &str) -> Option<f64> {
         return explicit_total;
     }
 
-    let mut tax_buckets = std::collections::HashMap::<String, f64>::new();
+    let mut seen_lines = std::collections::HashSet::<String>::new();
+    let mut tax_lines = std::collections::HashMap::<String, f64>::new();
     for line in text.lines() {
         let key = compact(line);
-        let bucket = ["tva", "vat", "gst", "qst", "hst", "tps", "tvq", "mwst", "iva", "btw"]
-            .iter()
-            .find(|needle| key.contains(**needle))
-            .map(|value| (*value).to_string());
-        let Some(bucket) = bucket else {
+        let Some(family) = tax_family(&key) else {
             continue;
         };
         if key.contains("numero") || key.contains("ident") || is_explicit_total_line(line) {
             continue;
         }
-        if let Some(amount) = last_amount(line) {
-            tax_buckets
-                .entry(bucket)
-                .and_modify(|existing| {
-                    if amount.abs() > existing.abs() {
-                        *existing = amount;
-                    }
-                })
-                .or_insert(amount);
+        let Some(amount) = last_amount(line) else {
+            continue;
+        };
+        let normalized_line = format!("{}|{:.2}", compact(line), amount);
+        if !seen_lines.insert(normalized_line) {
+            continue;
         }
+        let rate = tax_rate_signature(line).unwrap_or_else(|| format!("amount-{amount:.2}"));
+        let bucket = format!("{family}|{rate}|{amount:.2}");
+        tax_lines.entry(bucket).or_insert(amount);
     }
-    if tax_buckets.is_empty() {
+    if tax_lines.is_empty() {
         None
     } else {
-        let sum = tax_buckets.values().sum::<f64>();
+        let sum = tax_lines.values().sum::<f64>();
         (sum.abs() > 0.0001).then_some(sum)
     }
 }
@@ -554,6 +577,13 @@ mod tests {
         let augmented = augment_if_receipt(text);
         assert!(augmented.contains("Total HT : 20.00"));
         assert!(augmented.contains("Total TTC : 22.00"));
+    }
+
+    #[test]
+    fn sums_multiple_vat_rates_and_ignores_duplicate_ocr_lines() {
+        let text = "MAGASIN TEST\nTICKET X-77\n23/08/2026\nTVA 5,5% 0,55 EUR\nTVA 20% 2,40 EUR\nTVA 20% 2,40 EUR\nTOTAL TTC 27,95 EUR";
+        let hints = analyze(text);
+        assert_eq!(hints.amount_vat, Some(2.95));
     }
 
     #[test]
