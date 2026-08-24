@@ -1,7 +1,11 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::path::Path;
+use std::{collections::HashSet, fs, path::{Path, PathBuf}};
 use tauri::AppHandle;
+
+const ARCHIVE_ROOT_KEY: &str = "archive_root";
+const MAX_ARCHIVE_DEPTH: usize = 7;
+const MAX_ARCHIVE_FOLDERS: usize = 6000;
 
 #[derive(Serialize)]
 pub struct ArchiveWorkspaceItem {
@@ -18,6 +22,7 @@ pub struct ArchiveWorkspaceItem {
     pub confidence: i32,
     pub target_folder: Option<String>,
     pub target_source: String,
+    pub target_confidence: i32,
     pub charlemagne_status: String,
 }
 
@@ -27,6 +32,22 @@ pub struct ArchiveRuleRow {
     pub archive_folder: String,
     pub use_count: i64,
     pub updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct ArchiveScanResult {
+    pub root: String,
+    pub folders_scanned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogFolder {
+    path: String,
+    name: String,
+    normalized_name: String,
+    normalized_path: String,
+    depth: usize,
 }
 
 fn parsed_invoice(value: Option<String>) -> super::ParsedInvoice {
@@ -43,9 +64,277 @@ fn storage_assignment(value: Option<String>) -> super::StorageAssignment {
         .unwrap_or_default()
 }
 
+fn normalize(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| character.to_lowercase())
+        .map(|character| match character {
+            'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+            'ç' => 'c',
+            'è' | 'é' | 'ê' | 'ë' => 'e',
+            'ì' | 'í' | 'î' | 'ï' => 'i',
+            'ñ' => 'n',
+            'ò' | 'ó' | 'ô' | 'ö' | 'õ' => 'o',
+            'ù' | 'ú' | 'û' | 'ü' => 'u',
+            'ý' | 'ÿ' => 'y',
+            other => other,
+        })
+        .collect::<String>()
+}
+
+fn compact(value: &str) -> String {
+    normalize(value)
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn meaningful_tokens(value: &str) -> Vec<String> {
+    let normalized = normalize(value);
+    let ignored = [
+        "sas", "sarl", "sa", "snc", "eurl", "gmbh", "ltd", "limited", "societe", "company",
+        "france", "facture", "factures", "invoice", "invoices", "archive", "archives", "fournisseur",
+        "fournisseurs", "documents", "compta", "comptabilite",
+    ];
+    let mut tokens = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !ignored.contains(token))
+        .filter(|token| !(token.len() == 4 && token.chars().all(|character| character.is_ascii_digit())))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn ensure_catalog_table(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS archive_folder_catalog (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                normalized_path TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE INDEX IF NOT EXISTS idx_archive_folder_catalog_name
+             ON archive_folder_catalog(normalized_name);",
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn get_setting(connection: &Connection, key: &str) -> Result<Option<String>, String> {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn collect_archive_folders(root: &Path) -> Result<(Vec<CatalogFolder>, bool), String> {
+    let mut folders = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut truncated = false;
+
+    while let Some((folder, depth)) = stack.pop() {
+        if folders.len() >= MAX_ARCHIVE_FOLDERS {
+            truncated = true;
+            break;
+        }
+        if depth > MAX_ARCHIVE_DEPTH {
+            continue;
+        }
+
+        let name = folder
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_else(|| folder.to_string_lossy().as_ref())
+            .to_string();
+        let path = folder.to_string_lossy().into_owned();
+        folders.push(CatalogFolder {
+            normalized_name: compact(&name),
+            normalized_path: compact(&path),
+            name,
+            path,
+            depth,
+        });
+
+        if depth == MAX_ARCHIVE_DEPTH {
+            continue;
+        }
+        let entries = match fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        let mut children = Vec::<PathBuf>::new();
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                children.push(child);
+            }
+        }
+        children.sort();
+        for child in children.into_iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    Ok((folders, truncated))
+}
+
+fn load_catalog(connection: &Connection) -> Result<Vec<CatalogFolder>, String> {
+    ensure_catalog_table(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT path,name,normalized_name,normalized_path,depth
+             FROM archive_folder_catalog ORDER BY depth ASC,path ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(CatalogFolder {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                normalized_name: row.get(2)?,
+                normalized_path: row.get(3)?,
+                depth: row.get::<_, i64>(4)? as usize,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn suggestion_score(supplier: &str, folder: &CatalogFolder) -> i32 {
+    let supplier_compact = compact(supplier);
+    if supplier_compact.len() < 3 || folder.normalized_name.is_empty() {
+        return 0;
+    }
+    if folder.normalized_name == supplier_compact {
+        return 99;
+    }
+    if folder.normalized_name.contains(&supplier_compact) {
+        return 96;
+    }
+    if supplier_compact.contains(&folder.normalized_name) && folder.normalized_name.len() >= 5 {
+        return 91;
+    }
+
+    let supplier_tokens = meaningful_tokens(supplier);
+    if supplier_tokens.is_empty() {
+        return 0;
+    }
+    let folder_tokens = meaningful_tokens(&folder.name);
+    let path_tokens = meaningful_tokens(&folder.path);
+    let folder_set = folder_tokens.iter().collect::<HashSet<_>>();
+    let path_set = path_tokens.iter().collect::<HashSet<_>>();
+    let direct_matches = supplier_tokens
+        .iter()
+        .filter(|token| folder_set.contains(token))
+        .count();
+    let path_matches = supplier_tokens
+        .iter()
+        .filter(|token| path_set.contains(token))
+        .count();
+
+    if direct_matches == supplier_tokens.len() {
+        return 94 - (folder.depth.min(4) as i32);
+    }
+    if path_matches == supplier_tokens.len() {
+        return 88 - (folder.depth.min(5) as i32);
+    }
+    if direct_matches > 0 {
+        return 65 + ((direct_matches * 20) / supplier_tokens.len()) as i32;
+    }
+    if path_matches > 0 {
+        return 55 + ((path_matches * 18) / supplier_tokens.len()) as i32;
+    }
+    if folder.normalized_path.contains(&supplier_compact) {
+        return 86 - (folder.depth.min(5) as i32);
+    }
+    0
+}
+
+fn suggest_existing_folder(catalog: &[CatalogFolder], supplier: &str) -> Option<(String, i32)> {
+    catalog
+        .iter()
+        .filter(|folder| Path::new(&folder.path).is_dir())
+        .map(|folder| (folder.path.clone(), suggestion_score(supplier, folder)))
+        .filter(|(_, score)| *score >= 72)
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.len().cmp(&left.0.len())))
+}
+
+#[tauri::command]
+pub fn get_archive_root(app: AppHandle) -> Result<Option<String>, String> {
+    let connection = super::open_database(&app)?;
+    get_setting(&connection, ARCHIVE_ROOT_KEY)
+}
+
+#[tauri::command]
+pub fn set_archive_root(app: AppHandle, path: String) -> Result<ArchiveScanResult, String> {
+    let root = Path::new(path.trim());
+    if !root.is_dir() {
+        return Err("Le dossier racine des archives n'est pas accessible.".to_string());
+    }
+    let connection = super::open_database(&app)?;
+    connection
+        .execute(
+            "INSERT INTO settings(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![ARCHIVE_ROOT_KEY, root.to_string_lossy().as_ref()],
+        )
+        .map_err(|error| error.to_string())?;
+    scan_archive_tree(app)
+}
+
+#[tauri::command]
+pub fn scan_archive_tree(app: AppHandle) -> Result<ArchiveScanResult, String> {
+    let mut connection = super::open_database(&app)?;
+    ensure_catalog_table(&connection)?;
+    let root_value = get_setting(&connection, ARCHIVE_ROOT_KEY)?
+        .ok_or_else(|| "Aucun dossier racine d'archives n'est configuré.".to_string())?;
+    let root = Path::new(&root_value);
+    if !root.is_dir() {
+        return Err("Le dossier racine des archives n'est plus accessible.".to_string());
+    }
+    let (folders, truncated) = collect_archive_folders(root)?;
+
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM archive_folder_catalog", [])
+        .map_err(|error| error.to_string())?;
+    for folder in &folders {
+        transaction
+            .execute(
+                "INSERT INTO archive_folder_catalog(path,name,normalized_name,normalized_path,depth,scanned_at)
+                 VALUES(?1,?2,?3,?4,?5,CURRENT_TIMESTAMP)",
+                params![
+                    folder.path,
+                    folder.name,
+                    folder.normalized_name,
+                    folder.normalized_path,
+                    folder.depth as i64
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    Ok(ArchiveScanResult {
+        root: root_value,
+        folders_scanned: folders.len(),
+        truncated,
+    })
+}
+
 #[tauri::command]
 pub fn list_archive_workspace(app: AppHandle) -> Result<Vec<ArchiveWorkspaceItem>, String> {
     let connection = super::open_database(&app)?;
+    let catalog = load_catalog(&connection).unwrap_or_default();
     let mut statement = connection
         .prepare(
             "SELECT path,file_name,status,archive_path,archive_error,archived_at,
@@ -87,12 +376,31 @@ pub fn list_archive_workspace(app: AppHandle) -> Result<Vec<ArchiveWorkspaceItem
         } else {
             None
         };
-        let (target_folder, target_source) = if let Some(folder) = explicit_storage.archive_folder {
-            (Some(folder), if explicit_storage.source.is_empty() { "validation".to_string() } else { explicit_storage.source })
-        } else if let Some(rule) = learned_storage {
-            (rule.archive_folder, if rule.source.is_empty() { "memoire_fournisseur".to_string() } else { rule.source })
+        let inferred_storage = if explicit_storage.archive_folder.is_none() && learned_storage.is_none() {
+            parsed
+                .supplier
+                .as_deref()
+                .and_then(|supplier| suggest_existing_folder(&catalog, supplier))
         } else {
-            (None, "aucune".to_string())
+            None
+        };
+
+        let (target_folder, target_source, target_confidence) = if let Some(folder) = explicit_storage.archive_folder {
+            (
+                Some(folder),
+                if explicit_storage.source.is_empty() { "validation".to_string() } else { explicit_storage.source },
+                explicit_storage.confidence.max(100),
+            )
+        } else if let Some(rule) = learned_storage {
+            (
+                rule.archive_folder,
+                if rule.source.is_empty() { "memoire_fournisseur".to_string() } else { rule.source },
+                rule.confidence.max(99),
+            )
+        } else if let Some((folder, score)) = inferred_storage {
+            (Some(folder), "arborescence_existante".to_string(), score)
+        } else {
+            (None, "aucune".to_string(), 0)
         };
 
         output.push(ArchiveWorkspaceItem {
@@ -109,6 +417,7 @@ pub fn list_archive_workspace(app: AppHandle) -> Result<Vec<ArchiveWorkspaceItem
             confidence: parsed.confidence,
             target_folder,
             target_source,
+            target_confidence,
             charlemagne_status,
         });
     }
@@ -199,4 +508,43 @@ pub fn set_invoice_archive_destination(
         Some(folder),
     )?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{suggest_existing_folder, suggestion_score, CatalogFolder};
+
+    fn folder(path: &str, name: &str, depth: usize) -> CatalogFolder {
+        CatalogFolder {
+            path: path.to_string(),
+            name: name.to_string(),
+            normalized_name: super::compact(name),
+            normalized_path: super::compact(path),
+            depth,
+        }
+    }
+
+    #[test]
+    fn exact_supplier_folder_is_high_confidence() {
+        let candidate = folder(r"C:\Archives\DARTY ILE DE FRANCE", "DARTY ILE DE FRANCE", 2);
+        assert!(suggestion_score("DARTY ILE DE FRANCE", &candidate) >= 95);
+    }
+
+    #[test]
+    fn generic_year_folder_is_not_a_supplier_match() {
+        let candidate = folder(r"C:\Archives\2026\Factures", "Factures", 2);
+        assert_eq!(suggestion_score("DARTY ILE DE FRANCE", &candidate), 0);
+    }
+
+    #[test]
+    fn picks_existing_supplier_folder_over_generic_parent() {
+        let catalog = vec![
+            folder(r"C:\Archives", "Archives", 0),
+            folder(r"C:\Archives\2026", "2026", 1),
+            folder(r"C:\Archives\2026\DARTY", "DARTY", 2),
+        ];
+        let result = suggest_existing_folder(&catalog, "DARTY ILE DE FRANCE");
+        assert!(result.is_some());
+        assert!(result.unwrap().0.ends_with("DARTY"));
+    }
 }
