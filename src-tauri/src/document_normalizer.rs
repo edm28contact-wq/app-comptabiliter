@@ -128,17 +128,22 @@ fn normalize_date(day: u32, month: u32, mut year: u32) -> Option<String> {
 }
 
 fn date_in_line(line: &str) -> Option<String> {
-    let compact_spaces = line.split_whitespace().collect::<String>();
-    let iso = Regex::new(r"(?:^|\D)(19\d{2}|20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:\D|$)").ok()?;
-    if let Some(captures) = iso.captures(&compact_spaces) {
+    let iso = Regex::new(
+        r"(?:^|[^0-9])(19\d{2}|20\d{2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})(?:[^0-9]|$)",
+    )
+    .ok()?;
+    if let Some(captures) = iso.captures(line) {
         return normalize_date(
             captures.get(3)?.as_str().parse().ok()?,
             captures.get(2)?.as_str().parse().ok()?,
             captures.get(1)?.as_str().parse().ok()?,
         );
     }
-    let french = Regex::new(r"(?:^|\D)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?:\D|$)").ok()?;
-    let captures = french.captures(&compact_spaces)?;
+    let french = Regex::new(
+        r"(?:^|[^0-9])(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?:[^0-9]|$)",
+    )
+    .ok()?;
+    let captures = french.captures(line)?;
     normalize_date(
         captures.get(1)?.as_str().parse().ok()?,
         captures.get(2)?.as_str().parse().ok()?,
@@ -660,7 +665,13 @@ pub fn normalize_native_invoice_texts(app: AppHandle) -> Result<NativeNormalizat
 
 #[cfg(test)]
 mod tests {
-    use super::{augment_text, strong_fields, MARKER};
+    use super::{augment_text, date_in_line, strong_fields, MARKER};
+
+    #[test]
+    fn reads_date_followed_by_time() {
+        assert_eq!(date_in_line("31.08.2023 09:07").as_deref(), Some("31/08/2023"));
+        assert_eq!(date_in_line("31 / 08 / 2023 - 09:07").as_deref(), Some("31/08/2023"));
+    }
 
     #[test]
     fn reads_darty_style_invoice_without_ocr() {
