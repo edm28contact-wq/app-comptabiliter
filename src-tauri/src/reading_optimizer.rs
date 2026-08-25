@@ -511,13 +511,12 @@ pub fn optimize_invoice_readings(app: AppHandle) -> Result<ReadingOptimizationRe
                     result.deep_ocr += 1;
                     let ocr_text = read_text(&app, &path).unwrap_or_default();
                     let merged_raw = merge_texts(&native_text, &ocr_text);
-                    let (ocr_augmented, ocr_parsed, ocr_receipt) = optimized_parse(&ocr_text);
+                    let (_, ocr_parsed, ocr_receipt) = optimized_parse(&ocr_text);
                     let (merged_augmented, merged_parsed, merged_receipt) =
                         optimized_parse(&merged_raw);
                     let native_parsed = super::parse_invoice_text(&native_augmented);
                     let fused = fuse_parsed_candidates(&[
                         native_parsed,
-                        super::parse_invoice_text(&ocr_augmented),
                         ocr_parsed,
                         merged_parsed,
                     ]);
