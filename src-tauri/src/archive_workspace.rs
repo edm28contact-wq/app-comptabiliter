@@ -1,6 +1,10 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::{collections::HashSet, fs, path::{Path, PathBuf}};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 use tauri::AppHandle;
 
 const ARCHIVE_ROOT_KEY: &str = "archive_root";
@@ -50,6 +54,13 @@ struct CatalogFolder {
     depth: usize,
 }
 
+#[derive(Debug, Clone)]
+struct FolderSuggestion {
+    path: String,
+    score: i32,
+    exercise_match: bool,
+}
+
 fn parsed_invoice(value: Option<String>) -> super::ParsedInvoice {
     value
         .as_deref()
@@ -92,20 +103,58 @@ fn compact(value: &str) -> String {
 fn meaningful_tokens(value: &str) -> Vec<String> {
     let normalized = normalize(value);
     let ignored = [
-        "sas", "sarl", "sa", "snc", "eurl", "gmbh", "ltd", "limited", "societe", "company",
-        "france", "facture", "factures", "invoice", "invoices", "archive", "archives", "fournisseur",
-        "fournisseurs", "documents", "compta", "comptabilite",
+        "sas",
+        "sarl",
+        "sa",
+        "snc",
+        "eurl",
+        "gmbh",
+        "ltd",
+        "limited",
+        "societe",
+        "company",
+        "france",
+        "facture",
+        "factures",
+        "invoice",
+        "invoices",
+        "archive",
+        "archives",
+        "fournisseur",
+        "fournisseurs",
+        "documents",
+        "compta",
+        "comptabilite",
     ];
     let mut tokens = normalized
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| token.len() >= 3)
         .filter(|token| !ignored.contains(token))
-        .filter(|token| !(token.len() == 4 && token.chars().all(|character| character.is_ascii_digit())))
+        .filter(|token| {
+            !(token.len() == 4 && token.chars().all(|character| character.is_ascii_digit()))
+        })
         .map(str::to_string)
         .collect::<Vec<_>>();
     tokens.sort();
     tokens.dedup();
     tokens
+}
+
+fn extract_year(value: &str) -> Option<i32> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| part.len() == 4)
+        .filter_map(|part| part.parse::<i32>().ok())
+        .find(|year| (2000..=2100).contains(year))
+}
+
+fn path_years(value: &str) -> HashSet<i32> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| part.len() == 4)
+        .filter_map(|part| part.parse::<i32>().ok())
+        .filter(|year| (2000..=2100).contains(year))
+        .collect()
 }
 
 fn ensure_catalog_table(connection: &Connection) -> Result<(), String> {
@@ -209,19 +258,19 @@ fn load_catalog(connection: &Connection) -> Result<Vec<CatalogFolder>, String> {
         .map_err(|error| error.to_string())
 }
 
-fn suggestion_score(supplier: &str, folder: &CatalogFolder) -> i32 {
+fn supplier_score(supplier: &str, folder: &CatalogFolder) -> i32 {
     let supplier_compact = compact(supplier);
     if supplier_compact.len() < 3 || folder.normalized_name.is_empty() {
         return 0;
     }
     if folder.normalized_name == supplier_compact {
-        return 99;
+        return 91;
     }
     if folder.normalized_name.contains(&supplier_compact) {
-        return 96;
+        return 89;
     }
     if supplier_compact.contains(&folder.normalized_name) && folder.normalized_name.len() >= 5 {
-        return 91;
+        return 86;
     }
 
     let supplier_tokens = meaningful_tokens(supplier);
@@ -242,29 +291,80 @@ fn suggestion_score(supplier: &str, folder: &CatalogFolder) -> i32 {
         .count();
 
     if direct_matches == supplier_tokens.len() {
-        return 94 - (folder.depth.min(4) as i32);
+        return 88 - (folder.depth.min(4) as i32);
     }
     if path_matches == supplier_tokens.len() {
-        return 88 - (folder.depth.min(5) as i32);
+        return 83 - (folder.depth.min(5) as i32);
     }
     if direct_matches > 0 {
-        return 70 + ((direct_matches * 25) / supplier_tokens.len()) as i32;
+        return 68 + ((direct_matches * 18) / supplier_tokens.len()) as i32;
     }
     if path_matches > 0 {
-        return 60 + ((path_matches * 20) / supplier_tokens.len()) as i32;
+        return 60 + ((path_matches * 16) / supplier_tokens.len()) as i32;
     }
     if folder.normalized_path.contains(&supplier_compact) {
-        return 86 - (folder.depth.min(5) as i32);
+        return 82 - (folder.depth.min(5) as i32);
     }
     0
 }
 
-fn suggest_existing_folder(catalog: &[CatalogFolder], supplier: &str) -> Option<(String, i32)> {
-    catalog
+fn suggestion_score(
+    supplier: &str,
+    invoice_date: Option<&str>,
+    folder: &CatalogFolder,
+) -> (i32, bool) {
+    let base = supplier_score(supplier, folder);
+    if base == 0 {
+        return (0, false);
+    }
+
+    let Some(invoice_year) = invoice_date.and_then(extract_year) else {
+        return (base, false);
+    };
+    let years = path_years(&folder.path);
+    if years.contains(&invoice_year) {
+        return ((base + 8).min(99), true);
+    }
+    if !years.is_empty() {
+        return ((base - 24).max(0), false);
+    }
+    (base, false)
+}
+
+fn suggest_existing_folder(
+    catalog: &[CatalogFolder],
+    supplier: &str,
+    invoice_date: Option<&str>,
+) -> Option<FolderSuggestion> {
+    let mut candidates = catalog
         .iter()
-        .map(|folder| (folder.path.clone(), suggestion_score(supplier, folder)))
-        .filter(|(_, score)| *score >= 72)
-        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.len().cmp(&left.0.len())))
+        .filter_map(|folder| {
+            let (score, exercise_match) = suggestion_score(supplier, invoice_date, folder);
+            (score >= 72).then_some(FolderSuggestion {
+                path: folder.path.clone(),
+                score,
+                exercise_match,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.exercise_match.cmp(&left.exercise_match))
+            .then_with(|| right.path.len().cmp(&left.path.len()))
+    });
+
+    let best = candidates.first()?.clone();
+    if let Some(second) = candidates.get(1) {
+        let same_strength = second.score >= best.score - 1;
+        let same_exercise = second.exercise_match == best.exercise_match;
+        if same_strength && same_exercise && second.path != best.path {
+            return None;
+        }
+    }
+    Some(best)
 }
 
 #[tauri::command]
@@ -365,7 +465,18 @@ pub fn list_archive_workspace(app: AppHandle) -> Result<Vec<ArchiveWorkspaceItem
     drop(statement);
 
     let mut output = Vec::with_capacity(raw.len());
-    for (path, file_name, status, archive_path, archive_error, archived_at, parsed_json, storage_json, charlemagne_status) in raw {
+    for (
+        path,
+        file_name,
+        status,
+        archive_path,
+        archive_error,
+        archived_at,
+        parsed_json,
+        storage_json,
+        charlemagne_status,
+    ) in raw
+    {
         let parsed = parsed_invoice(parsed_json);
         let explicit_storage = storage_assignment(storage_json);
         let learned_storage = if explicit_storage.archive_folder.is_none() {
@@ -376,32 +487,49 @@ pub fn list_archive_workspace(app: AppHandle) -> Result<Vec<ArchiveWorkspaceItem
         } else {
             None
         };
-        let inferred_storage = if explicit_storage.archive_folder.is_none() && learned_storage.is_none() {
-            parsed
-                .supplier
-                .as_deref()
-                .and_then(|supplier| suggest_existing_folder(&catalog, supplier))
+        let inferred_storage = if explicit_storage.archive_folder.is_none() && learned_storage.is_none()
+        {
+            parsed.supplier.as_deref().and_then(|supplier| {
+                suggest_existing_folder(&catalog, supplier, parsed.invoice_date.as_deref())
+            })
         } else {
             None
         };
 
-        let (target_folder, target_source, target_confidence) = if let Some(folder) = explicit_storage.archive_folder {
-            (
-                Some(folder),
-                if explicit_storage.source.is_empty() { "validation".to_string() } else { explicit_storage.source },
-                explicit_storage.confidence.max(100),
-            )
-        } else if let Some(rule) = learned_storage {
-            (
-                rule.archive_folder,
-                if rule.source.is_empty() { "memoire_fournisseur".to_string() } else { rule.source },
-                rule.confidence.max(99),
-            )
-        } else if let Some((folder, score)) = inferred_storage {
-            (Some(folder), "arborescence_existante".to_string(), score)
-        } else {
-            (None, "aucune".to_string(), 0)
-        };
+        let (target_folder, target_source, target_confidence) =
+            if let Some(folder) = explicit_storage.archive_folder {
+                (
+                    Some(folder),
+                    if explicit_storage.source.is_empty() {
+                        "validation".to_string()
+                    } else {
+                        explicit_storage.source
+                    },
+                    explicit_storage.confidence.max(100),
+                )
+            } else if let Some(rule) = learned_storage {
+                (
+                    rule.archive_folder,
+                    if rule.source.is_empty() {
+                        "memoire_fournisseur".to_string()
+                    } else {
+                        rule.source
+                    },
+                    rule.confidence.max(99),
+                )
+            } else if let Some(suggestion) = inferred_storage {
+                (
+                    Some(suggestion.path),
+                    if suggestion.exercise_match {
+                        "arborescence_exercice".to_string()
+                    } else {
+                        "arborescence_existante".to_string()
+                    },
+                    suggestion.score,
+                )
+            } else {
+                (None, "aucune".to_string(), 0)
+            };
 
         output.push(ArchiveWorkspaceItem {
             path,
@@ -497,7 +625,12 @@ pub fn set_invoice_archive_destination(
         .map_err(|error| error.to_string())?;
 
     if remember_supplier {
-        if let Some(supplier) = parsed.supplier.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(supplier) = parsed
+            .supplier
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             super::save_storage_rule(&transaction, supplier, &storage)?;
         }
     }
@@ -512,7 +645,9 @@ pub fn set_invoice_archive_destination(
 
 #[cfg(test)]
 mod tests {
-    use super::{suggest_existing_folder, suggestion_score, CatalogFolder};
+    use super::{
+        extract_year, suggest_existing_folder, suggestion_score, CatalogFolder,
+    };
 
     fn folder(path: &str, name: &str, depth: usize) -> CatalogFolder {
         CatalogFolder {
@@ -525,15 +660,55 @@ mod tests {
     }
 
     #[test]
+    fn extracts_exercise_from_invoice_date() {
+        assert_eq!(extract_year("31/08/2026"), Some(2026));
+        assert_eq!(extract_year("2026-08-31"), Some(2026));
+    }
+
+    #[test]
     fn exact_supplier_folder_is_high_confidence() {
-        let candidate = folder(r"C:\Archives\DARTY ILE DE FRANCE", "DARTY ILE DE FRANCE", 2);
-        assert!(suggestion_score("DARTY ILE DE FRANCE", &candidate) >= 95);
+        let candidate = folder(r"C:\Archives\2026\DARTY ILE DE FRANCE", "DARTY ILE DE FRANCE", 2);
+        let (score, exercise_match) = suggestion_score(
+            "DARTY ILE DE FRANCE",
+            Some("31/08/2026"),
+            &candidate,
+        );
+        assert!(score >= 95);
+        assert!(exercise_match);
     }
 
     #[test]
     fn generic_year_folder_is_not_a_supplier_match() {
         let candidate = folder(r"C:\Archives\2026\Factures", "Factures", 2);
-        assert_eq!(suggestion_score("DARTY ILE DE FRANCE", &candidate), 0);
+        assert_eq!(
+            suggestion_score("DARTY ILE DE FRANCE", Some("31/08/2026"), &candidate).0,
+            0
+        );
+    }
+
+    #[test]
+    fn prefers_invoice_exercise_when_supplier_exists_in_multiple_years() {
+        let catalog = vec![
+            folder(r"C:\Archives\2025\DARTY", "DARTY", 2),
+            folder(r"C:\Archives\2026\DARTY", "DARTY", 2),
+        ];
+        let result = suggest_existing_folder(
+            &catalog,
+            "DARTY ILE DE FRANCE",
+            Some("22/09/2026"),
+        )
+        .expect("une destination 2026 doit etre trouvee");
+        assert!(result.path.contains("2026"));
+        assert!(result.exercise_match);
+    }
+
+    #[test]
+    fn refuses_ambiguous_supplier_folders_without_invoice_date() {
+        let catalog = vec![
+            folder(r"C:\Archives\2025\DARTY", "DARTY", 2),
+            folder(r"C:\Archives\2026\DARTY", "DARTY", 2),
+        ];
+        assert!(suggest_existing_folder(&catalog, "DARTY ILE DE FRANCE", None).is_none());
     }
 
     #[test]
@@ -543,8 +718,12 @@ mod tests {
             folder(r"C:\Archives\2026", "2026", 1),
             folder(r"C:\Archives\2026\DARTY", "DARTY", 2),
         ];
-        let result = suggest_existing_folder(&catalog, "DARTY ILE DE FRANCE");
+        let result = suggest_existing_folder(
+            &catalog,
+            "DARTY ILE DE FRANCE",
+            Some("22/09/2026"),
+        );
         assert!(result.is_some());
-        assert!(result.unwrap().0.ends_with("DARTY"));
+        assert!(result.unwrap().path.ends_with("DARTY"));
     }
 }
