@@ -24,6 +24,33 @@ type NativeNormalizationResult = {
   errors: number;
 };
 
+export type InvoiceReadingOptimizationSnapshot = {
+  timestamp: string;
+  native: NativeNormalizationResult;
+  standard: OptimizationResult;
+  focused: FocusedOptimizationResult;
+  secondPass: OptimizationResult | null;
+  totalInspected: number;
+  totalChanged: number;
+  totalErrors: number;
+};
+
+const SNAPSHOT_STORAGE_KEY = "app-comptabiliter:last-reading-optimization";
+
+function publishSnapshot(snapshot: InvoiceReadingOptimizationSnapshot) {
+  try {
+    window.localStorage.setItem(SNAPSHOT_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Les métriques de diagnostic ne doivent jamais bloquer le traitement.
+  }
+  window.dispatchEvent(
+    new CustomEvent<InvoiceReadingOptimizationSnapshot>(
+      "invoice-reading-optimization-completed",
+      { detail: snapshot },
+    ),
+  );
+}
+
 export default function ReadingOptimizer() {
   const busy = useRef(false);
 
@@ -48,19 +75,32 @@ export default function ReadingOptimizer() {
         // Une passe focalisée peut révéler de nouveaux champs. On repasse
         // immédiatement dans le moteur de fusion/cohérence pour éviter
         // d'attendre le prochain cycle de 3 secondes.
-        let secondPassChanged = 0;
+        let secondPass: OptimizationResult | null = null;
         if (focused.improved > 0) {
-          const second = await invoke<OptimizationResult>("optimize_invoice_readings");
-          secondPassChanged = second.changed;
+          secondPass = await invoke<OptimizationResult>("optimize_invoice_readings");
         }
 
-        if (
-          !stopped &&
-          (native.normalized > 0 ||
-            result.changed > 0 ||
-            focused.improved > 0 ||
-            secondPassChanged > 0)
-        ) {
+        if (stopped) return;
+
+        const snapshot: InvoiceReadingOptimizationSnapshot = {
+          timestamp: new Date().toISOString(),
+          native,
+          standard: result,
+          focused,
+          secondPass,
+          totalInspected:
+            native.inspected + result.inspected + focused.inspected +
+            (secondPass?.inspected ?? 0),
+          totalChanged:
+            native.normalized + result.changed + focused.improved +
+            (secondPass?.changed ?? 0),
+          totalErrors:
+            native.errors + result.errors + focused.errors +
+            (secondPass?.errors ?? 0),
+        };
+        publishSnapshot(snapshot);
+
+        if (snapshot.totalChanged > 0) {
           window.dispatchEvent(new Event("invoice-reading-updated"));
         }
       } catch {
