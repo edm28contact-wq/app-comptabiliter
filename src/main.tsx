@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import ArchiveWorkspace from "./ArchiveWorkspace";
 import CharlemagneMode from "./CharlemagneMode";
+import CharlemagneTxtPreview from "./CharlemagneTxtPreview";
 import ReadingOptimizer from "./ReadingOptimizer";
 import StrictReviewGate from "./StrictReviewGate";
 import "./styles.css";
@@ -27,6 +28,7 @@ function Root() {
       <ReadingOptimizer />
       <StrictReviewGate />
       <CharlemagneMode />
+      <CharlemagneTxtPreview />
     </>
   );
 }
