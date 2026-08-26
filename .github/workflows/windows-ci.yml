@@ -1,0 +1,62 @@
+name: Windows CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Generate Windows test icons
+        shell: pwsh
+        run: |
+          @'
+          <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+            <rect width="512" height="512" rx="96" fill="#172033"/>
+            <rect x="104" y="92" width="304" height="328" rx="36" fill="#ffffff"/>
+            <rect x="144" y="144" width="224" height="28" rx="14" fill="#315efb"/>
+            <rect x="144" y="208" width="224" height="24" rx="12" fill="#c7cfdb"/>
+            <rect x="144" y="264" width="160" height="24" rx="12" fill="#c7cfdb"/>
+            <path d="M166 348l42 42 122-126" fill="none" stroke="#287244" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          '@ | Set-Content -Path src-tauri/app-icon.svg -Encoding utf8
+          npm run tauri -- icon src-tauri/app-icon.svg
+
+      - name: Check frontend
+        run: npm run build
+
+      - name: Test Rust
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Build Windows test installer
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Upload Windows test installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-comptabiliter-windows-test
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

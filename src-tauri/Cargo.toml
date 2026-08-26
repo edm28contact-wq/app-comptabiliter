@@ -1,0 +1,41 @@
+[package]
+name = "app-comptabiliter"
+version = "0.11.0"
+description = "Assistant de comptabilite fournisseurs pour Charlemagne"
+authors = ["edm28contact-wq"]
+edition = "2021"
+
+[lib]
+name = "app_comptabiliter_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+pdf-extract = "0.12.0"
+regex = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage",
+    "Storage_Streams",
+    "Win32_System_WinRT"
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
