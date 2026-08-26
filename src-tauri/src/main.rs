@@ -7,6 +7,7 @@ mod bank_workspace;
 mod charlemagne_connector;
 mod charlemagne_mirror;
 mod charlemagne_sync;
+mod charlemagne_txt;
 mod ingestion;
 mod receipt;
 mod reading_optimizer;
@@ -52,6 +53,7 @@ fn main() {
             archive_workspace::set_invoice_archive_destination,
             charlemagne_connector::get_charlemagne_connector_status,
             charlemagne_connector::set_charlemagne_connector_mode,
+            charlemagne_txt::preview_charlemagne_import_txt,
             charlemagne_sync::get_charlemagne_sync_folder,
             charlemagne_sync::set_charlemagne_sync_folder,
             charlemagne_sync::import_charlemagne_sync_file,
